@@ -16,7 +16,7 @@ exclude = [
     "examples/hypridle.conf",
     "examples/hyprland.conf",
     "*.tar.gz",
-    "CLAUDE.md",
+    "AGENTS.md",
     "PKGBUILD",
     "flake.nix",
     "flake.lock",

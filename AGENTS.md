@@ -1,10 +1,10 @@
-# CLAUDE.md — hyprsaver
+# hyprsaver — repository instructions
 
 ## Project Overview
 hyprsaver is a Wayland-native screensaver for Hyprland. It renders GLSL fractal shaders on fullscreen wlr-layer-shell overlay surfaces via OpenGL ES (glow). It integrates with hypridle (timeout orchestration) and coexists with hyprlock (lock screen). The two are intentionally separate — Unix philosophy.
 
 ## Architecture
-Twelve modules in `src/` (plus `main.rs`):
+Twelve supporting modules in `src/` (plus `main.rs`):
 - `wayland.rs` — Wayland connection, output enumeration, layer-shell surface lifecycle. Uses smithay-client-toolkit. One surface per monitor. Hosts the calloop event loop, calls `CycleManager::tick(now)` each frame, and dispatches `CycleEvent`s to advance shaders/palettes. Frame pacing: a render timer at `fps`, gated per surface by `wl_surface.frame` callbacks (1 s fallback), with EGL swap interval 0 so `eglSwapBuffers` never blocks on a hidden output. Fractional/HiDPI scaling via wp-fractional-scale-v1 + wp_viewporter (`scale_factor` is `f32`).
 - `renderer.rs` — OpenGL via glow. Fullscreen quad, uploads uniforms (time, resolution, palette vectors, speed/zoom scales, alpha fade), calls draw. Doesn't know about Wayland. Owns the shader-crossfade `TransitionRenderer` (two FBOs + composite pass) and the feedback `FeedbackBuffers` ping-pong pair: a program whose `u_prev_frame` sampler survives compilation renders into `back` while reading `front` (texture unit 3), unfaded, and a `PresentPass` puts `front` on screen with `u_alpha`. `render_offscreen()` is the explicit-time path shared by `render-preview` and `bench`.
 - `shaders.rs` — Loads `.frag` files from config dir and built-ins. Handles compilation, hot-reload (notify crate), Shadertoy uniform remapping. Prepends palette function to all shaders. Manages cycle playlists (`set_playlist`, `cycle_next`, `randomize_cycle_start`).
@@ -18,17 +18,28 @@ Twelve modules in `src/` (plus `main.rs`):
 - `headless_egl.rs` — Surfaceless EGL context for `render-preview` and `bench` (no Wayland surface needed). Logs the GL renderer string at `info` (llvmpipe vs GPU).
 - `bench.rs` — `bench` subcommand: renders each shader offscreen for `--frames` frames spread over `--span` seconds of shader time, `glFinish`, and reports ms/frame and `util% = frame_ms × monitors / (1000 / fps)` with the Lightweight/Medium/Heavy/Ultra tier. `--markdown` for `docs/BENCHMARK_*.md`, `--json` for tooling. Its percentages are pure render throughput, ~3–4× lower than the historical `radeontop` figures; rankings and tier thresholds are what matter.
 
-Entry point: `main.rs` — CLI (clap), signal handling (signal-hook), config load, then dispatches to `preview.rs` (windowed preview) or `wayland.rs` (layer-shell screensaver). Event loop is calloop.
+Entry point: `main.rs` — CLI (clap), signal handling (signal-hook), config load, then dispatches to `render_preview.rs` / `bench.rs` for subcommands,
+`preview.rs` for windowed preview or `wayland.rs` for the layer-shell screensaver. Event loop is calloop.
 
 ## Build Environment
 
-**Claude Code cloud sessions** do not have all system libraries installed (notably `xkbcommon`). There, `cargo build` fails at the linker stage — expected, not a code error — so:
-1. Run `touch src/shaders.rs` after editing shader files (`.frag`, `.vert`) to invalidate the cargo cache
-2. Do NOT run `cargo build` — it will fail on missing system deps
-3. Do NOT attempt to install system packages
-4. Commit changes and push to the current feature branch
+`Cargo.toml` currently declares version 0.4.8, Rust edition 2021 and MSRV 1.88.
+Check system prerequisites before selecting validation: CI installs Wayland,
+Wayland EGL backend, Mesa EGL/GL, xkbcommon development libraries and pkg-config.
+Missing host libraries are an environment limitation, not proof of a code defect.
+Do not install system packages merely to validate a documentation change.
 
-**Local sessions on Mara's Arch machine** have every dependency. Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets` before every commit. CI additionally runs `cargo deny`, `cargo audit`, and an MSRV build (`rust-version` in `Cargo.toml`, lock file removed).
+With dependencies available, the CI checks are `cargo fmt --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`, and
+`cargo test --all-targets`. CI separately runs `cargo deny check`, `cargo audit`
+and an MSRV build. Its MSRV job removes the lockfile in a disposable checkout;
+do not remove a user's lockfile as routine local validation. No claim about a
+particular assistant platform or the current host's installed libraries is assumed.
+
+For stale shader-build caches, touching `src/shaders.rs` is an existing workaround,
+not a required source change on every edit. First confirm that the build actually
+missed an included shader change. Do not run a build, commit or push merely because
+this guide lists those operations; follow the authorized task scope.
 
 ## Build & Run
 ```sh
@@ -41,13 +52,13 @@ cargo build --release
 ./target/release/hyprsaver bench geometry --frames 240 --span 30   # one shader, longer sample
 ```
 
-Shader work checklist: `hyprsaver bench <name>` before and after; visual parity via `render-preview` frames (`python3` + PIL diff of extracted frames is enough); `touch src/shaders.rs` after `.frag` edits.
+Shader work checklist: `hyprsaver bench <name>` before and after; visual parity via `render-preview` frames (`python3` + PIL diff of extracted frames is enough); check rebuild freshness after `.frag` edits.
 
 ## Key Design Decisions
 - **glow over wgpu**: Thin OpenGL wrapper, minimal complexity for v1. wgpu (Vulkan support) remains on the long-term roadmap.
 - **Cosine palettes + LUT**: 12 floats or a 256×1 PNG strip. LUT palettes on texture units 1/2.
 - **Shadertoy compat**: Shaders use Shadertoy conventions (iTime, iResolution, mainImage). A shim in shaders.rs remaps to our uniforms. Users can paste Shadertoy code with minimal edits.
-- **Palette as uniforms, not in-shader**: Palettes are uploaded as vec3 uniforms. Shaders call `palette(t)` with a float. This decouples color from math — any shader × any palette.
+- **Palette as uniforms, not in-shader**: Palettes are uploaded as vec3 uniforms. Shaders call `palette(t)` with a float. This generally decouples color from math. `hyperflower` intentionally keeps its own cosine rainbow palette instead of the shared palette LUT.
 - **Belt-and-suspenders exit**: Exits on either (1) input events on the layer surface or (2) SIGTERM from hypridle's on-resume. Both paths must work independently. A shutdown watchdog in `main.rs` force-exits the process `fade_out_ms` + 3 s after the first signal (immediately on a second signal), so a wedged event loop can never keep the exclusive keyboard grab alive (issue #348). `force_exit()` removes the PID file only if it names this process.
 - **Never block the render loop on the compositor**: EGL swap interval is 0 and each surface renders only once its previous frame callback has fired (or 1 s has passed). An output that stops presenting (DPMS off, unplugged) idles at ~1 fps instead of parking the whole loop inside `eglSwapBuffers`. Fade-out is time-based, so dismissal completes even on an output that never presents.
 - **Hot-reload**: Filesystem watcher on shader dir. On change, recompile shader; on compile error, log and keep current shader. No restart needed.
@@ -73,12 +84,13 @@ Shader work checklist: `hyprsaver bench <name>` before and after; visual parity 
 - Built-in shaders: compiled into binary via `include_str!()`
 - Logs: stderr (journalctl if launched by hypridle)
 
-## Built-in Shaders (v0.4.7 — 36 total)
+## Built-in Shaders (current: 37)
 
 `mandelbrot` was removed in v0.4.4 (GPU architectural mismatch on deep zoom). Do NOT add it back. `network` was removed in the same cycle (plexus aesthetic is vertex-native, not fragment-native); `circuit` and `sonar` are its fragment-native replacements.
 
 | Name          | Description                                              |
 |---------------|----------------------------------------------------------|
+| hyperflower   | Additional built-in shader; see `shaders/hyperflower.frag` |
 | julia         | Julia set with animated parameter                        |
 | shipburn      | Burning-Ship Julia — `abs()`-folded z² + c for angular mirror-symmetric "ship" silhouettes |
 | fractaltrap   | Julia with orbit-trap coloring (unit circle trap) — stained-glass / cellular aesthetic |
@@ -123,8 +135,8 @@ Shader work checklist: `hyprsaver bench <name>` before and after; visual parity 
 Cycle scheduling is handled by `CycleManager` in `cycle.rs`. `wayland.rs` calls `CycleManager::tick()` each frame and dispatches the returned `CycleEvent`s — advancing all `Renderer` instances simultaneously so monitors stay in sync.
 
 ## Testing Strategy
-- Unit tests: `#[cfg(test)]` modules in `bench`, `config`, `cycle`, `palette`, `renderer`, `shaders`, `shuffle`, `wayland` — palette math (`color_at` for known inputs), config deserialization (missing fields → defaults), Shadertoy shim (uniform remapping), `u_prev_frame` injection, playlist cycle, built-in shader count (`test_builtin_shader_count` asserts 36; `test_every_shader_file_is_registered` keeps `shaders/*.frag` and the registration list in sync), shuffle-bag uniformity + no-consecutive-repeats, bench tier thresholds.
-- Headless: `render-preview` and `bench` run on this machine's GPU and under Mesa llvmpipe (`LIBGL_ALWAYS_SOFTWARE=1 EGL_PLATFORM=surfaceless`), which is what the Gallery workflow uses in CI.
+- Unit tests: `#[cfg(test)]` modules in `bench`, `config`, `cycle`, `palette`, `renderer`, `shaders`, `shuffle`, `wayland` — palette math (`color_at` for known inputs), config deserialization (missing fields → defaults), Shadertoy shim (uniform remapping), `u_prev_frame` injection, playlist cycle, built-in shader count (`test_builtin_shader_count` checks the registered count; `test_every_shader_file_is_registered` keeps `shaders/*.frag` and the registration list in sync), shuffle-bag uniformity + no-consecutive-repeats, bench tier thresholds.
+- Headless: `render-preview` and `bench` can run with a suitable GPU or under Mesa llvmpipe (`LIBGL_ALWAYS_SOFTWARE=1 EGL_PLATFORM=surfaceless`), which is what the Gallery workflow uses in CI.
 - Integration: `--preview` mode with a test shader, assert it opens a window and renders frames without panic.
 - Manual: run under Hyprland, verify layer surface appears on all monitors, verify input dismiss, verify SIGTERM dismiss, verify hot-reload, verify cycle advances across monitors.
 
@@ -168,6 +180,12 @@ Two additional uniforms are injected by `prepare_shader()` in `shaders.rs` for e
 **In daemon mode** both uniforms are always uploaded as `1.0` — no behavioral change from before.
 
 **In preview mode** the egui control panel's Speed and Zoom sliders call `Renderer::set_speed_scale()` / `set_zoom_scale()` which are forwarded to the shader each frame.
+
+## Historical release notes
+
+The following dated notes preserve project decisions and prior observations. They
+are not current test results; use Cargo.toml, CHANGELOG.md and source for current
+versions and behavior. Performance measurements are hardware-specific.
 
 ## Roadmap Summary
 - v0.1.0: Core screensaver. Layer-shell, glow, cosine palettes, built-in shaders, hot-reload, preview mode. ✓ shipped
@@ -274,4 +292,4 @@ All features through v0.4.2 implemented:
 - Shader fixes: Oscilloscope time wrapping (prevents float precision loss after hours); Tesla orbit radius clamped to screen bounds.
 - Config defaults at the time: `shader_cycle_interval = 120`, `palette_cycle_interval = 20`, `palette_transition_duration = 2.0`. (Superseded in v0.4.4 by `300` / `60` / `0.0`.)
 - Example config: default playlists added (Elements, Math, Nature, Psychedelic, Tech).
-- **Note**: After editing built-in shader `.frag` files in `shaders/`, run `touch src/shaders.rs` (or `cargo clean`) to force recompile — `include_str!()` does not trigger recompilation on shader-only changes in all tool configurations.
+- **Historical cache workaround**: if a shader-only change is not picked up, touching `src/shaders.rs` forces recompilation. Confirm stale output first; avoid broad `cargo clean` as a routine step.
