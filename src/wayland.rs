@@ -229,6 +229,7 @@ impl Surface {
         shader_compiled: &str,
         seed: u32,
         palette: &crate::palette::PaletteEntry,
+        fps: u32,
     ) -> anyhow::Result<()> {
         let w = self.phys_width().max(1) as i32;
         let h = self.phys_height().max(1) as i32;
@@ -295,6 +296,7 @@ impl Surface {
         };
 
         let mut renderer = Renderer::new(gl).context("Renderer::new failed")?;
+        renderer.set_nominal_fps(fps);
         renderer
             .load_shader(shader_compiled, seed)
             .context("initial shader load failed")?;
@@ -1446,7 +1448,9 @@ impl LayerShellHandler for WaylandState {
 
                 // Surfaces that appear mid-run join with the current seed.
                 let seed = self.shader_seeds.current();
-                if let Err(e) = surf.init_gl(unsafe { &*egl_ptr }, &shader_compiled, seed, &palette)
+                let fps = self.config.general.fps.max(1);
+                if let Err(e) =
+                    surf.init_gl(unsafe { &*egl_ptr }, &shader_compiled, seed, &palette, fps)
                 {
                     log::error!("Failed to init GL for surface: {e:#}");
                 } else {

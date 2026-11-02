@@ -14,6 +14,7 @@ use glow::HasContext as _;
 use std::time::Instant;
 
 use crate::palette::PaletteEntry;
+use crate::shaders::{Rate, StateSize};
 
 // ---------------------------------------------------------------------------
 // Uniform locations cache
@@ -41,6 +42,13 @@ pub struct UniformLocations {
     pub u_prev_frame: Option<glow::UniformLocation>,
     /// Per-load random seed (`uint`).
     pub u_seed: Option<glow::UniformLocation>,
+    // State pass (`@state` shaders only)
+    pub u_state: Option<glow::UniformLocation>,
+    pub u_state_resolution: Option<glow::UniformLocation>,
+    pub u_dt: Option<glow::UniformLocation>,
+    pub u_step: Option<glow::UniformLocation>,
+    pub u_pass: Option<glow::UniformLocation>,
+    pub u_sim_time: Option<glow::UniformLocation>,
 }
 
 impl UniformLocations {
@@ -62,6 +70,12 @@ impl UniformLocations {
             u_zoom_scale: gl.get_uniform_location(prog, "u_zoom_scale"),
             u_prev_frame: gl.get_uniform_location(prog, "u_prev_frame"),
             u_seed: gl.get_uniform_location(prog, "u_seed"),
+            u_state: gl.get_uniform_location(prog, "u_state"),
+            u_state_resolution: gl.get_uniform_location(prog, "u_state_resolution"),
+            u_dt: gl.get_uniform_location(prog, "u_dt"),
+            u_step: gl.get_uniform_location(prog, "u_step"),
+            u_pass: gl.get_uniform_location(prog, "u_pass"),
+            u_sim_time: gl.get_uniform_location(prog, "u_sim_time"),
         }
     }
 }
@@ -485,6 +499,24 @@ impl FeedbackBuffers {
         Ok(fb)
     }
 
+    /// Like [`FeedbackBuffers::resize`], but returns `Err` instead of
+    /// panicking if a reallocated target is incomplete.
+    pub fn try_resize(
+        &mut self,
+        gl: &glow::Context,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<()> {
+        if self.targets[0].width == width && self.targets[0].height == height {
+            return Ok(());
+        }
+        for t in self.targets.iter_mut() {
+            t.try_resize(gl, width, height)?;
+        }
+        self.clear(gl);
+        Ok(())
+    }
+
     /// Reallocate both buffers if the size changed (contents are cleared).
     pub fn resize(&mut self, gl: &glow::Context, width: u32, height: u32) {
         if self.targets[0].width == width && self.targets[0].height == height {
@@ -525,6 +557,198 @@ impl FeedbackBuffers {
         let [a, b] = self.targets;
         a.destroy(gl);
         b.destroy(gl);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StateSim — state pass of a `@state` shader
+// ---------------------------------------------------------------------------
+
+/// Most simulated time one live frame may advance a state sim, in seconds.
+/// An output idling at ~1 fps (DPMS off) or a frame that includes a shader
+/// compile would otherwise catch up a whole second of steps at once.
+const MAX_FRAME_DT: f64 = 1.0 / 15.0;
+
+/// Texture unit of `u_state` (1–2 are the palette LUTs, 3 is `u_prev_frame`).
+const STATE_TEXTURE_UNIT: u32 = 4;
+
+/// Nominal output a thumbnail's `Scale` state is sized from (the
+/// `render-preview` default), so its pattern matches the live shader.
+const THUMBNAIL_STATE_OUTPUT: [u32; 2] = [480, 270];
+
+/// Most state steps a thumbnail runs.
+const THUMBNAIL_MAX_STEPS: u32 = 300;
+
+/// Steps one `advance` runs: `warm` prewarm steps at `warm_dt`, then
+/// `steps` regular steps at `step_dt`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StepPlan {
+    warm: u32,
+    steps: u32,
+    warm_dt: f64,
+    step_dt: f64,
+}
+
+/// Step bookkeeping of a state sim; pure, so the stepping rules are unit
+/// tested without GL.
+#[derive(Debug, Clone)]
+struct SimClock {
+    rate: Rate,
+    prewarm: u32,
+    /// Steps since the last reset (`u_step`; 0 → the next step seeds).
+    step: u32,
+    /// Unspent frame time for `Rate::Hz`, in seconds.
+    accum: f64,
+    /// Simulated seconds since the last reset (`u_sim_time`).
+    sim_time: f64,
+    /// `dt` of the last step (`u_dt` in the image pass).
+    last_dt: f64,
+    prewarm_left: u32,
+}
+
+impl SimClock {
+    fn new(rate: Rate, prewarm: u32) -> Self {
+        Self {
+            rate,
+            prewarm,
+            step: 0,
+            accum: 0.0,
+            sim_time: 0.0,
+            last_dt: 0.0,
+            prewarm_left: prewarm,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new(self.rate, self.prewarm);
+    }
+
+    /// Decide the steps for a frame that took `frame_dt` seconds.
+    ///
+    /// `live` (the screensaver, preview and `bench`) clamps `frame_dt` to
+    /// [`MAX_FRAME_DT`] and caps steps per frame; `render-preview` and
+    /// thumbnails pass `false`. `nominal_dt` (1 / fps) is the prewarm step of
+    /// `Rate::PerFrame`, whose real `dt` may be tiny or clamped.
+    fn plan(&mut self, frame_dt: f64, live: bool, nominal_dt: f64) -> StepPlan {
+        let frame_dt = if live {
+            frame_dt.clamp(0.0, MAX_FRAME_DT)
+        } else {
+            frame_dt.max(0.0)
+        };
+        let (steps, step_dt, warm_budget) = match self.rate {
+            Rate::PerFrame => (1, frame_dt, if live { 4 } else { u32::MAX }),
+            Rate::Hz(hz) => {
+                let hz = f64::from(hz);
+                let step_dt = 1.0 / hz;
+                let cap = if live {
+                    (hz * MAX_FRAME_DT).ceil().max(1.0) as u32
+                } else {
+                    u32::MAX
+                };
+                self.accum += frame_dt;
+                let n = ((self.accum / step_dt) as u32).min(cap);
+                // A capped backlog is dropped, not carried over.
+                self.accum = (self.accum - f64::from(n) * step_dt).min(step_dt);
+                (n, step_dt, cap)
+            }
+        };
+        // Never show the cleared texture: the seed step runs before the
+        // first image pass even when no time has passed yet.
+        let steps = if self.step == 0 { steps.max(1) } else { steps };
+        let warm = self.prewarm_left.min(warm_budget);
+        self.prewarm_left -= warm;
+        let warm_dt = match self.rate {
+            Rate::PerFrame => nominal_dt,
+            Rate::Hz(_) => step_dt,
+        };
+        StepPlan {
+            warm,
+            steps,
+            warm_dt,
+            step_dt,
+        }
+    }
+
+    /// Account for one completed step of `dt` seconds.
+    fn record(&mut self, dt: f64) {
+        self.step = self.step.wrapping_add(1);
+        self.sim_time += dt;
+        self.last_dt = dt;
+    }
+}
+
+/// State texture size for `spec` at the given output size, clamped to
+/// `1 ..= max` texels per side.
+fn state_size(size: StateSize, output: [u32; 2], max: u32) -> [u32; 2] {
+    let [w, h] = match size {
+        StateSize::Fixed(w, h) => [w, h],
+        StateSize::Scale(s) => output.map(|v| (v as f32 * s).round() as u32),
+    };
+    [w, h].map(|v| v.clamp(1, max.max(1)))
+}
+
+/// State-related uniforms for one draw (`u_state` on texture unit 4).
+#[derive(Debug, Clone, Copy)]
+struct StateBinding {
+    texture: glow::Texture,
+    size: [u32; 2],
+    dt: f32,
+    step: i32,
+    pass: i32,
+    sim_time: f32,
+}
+
+/// State pass of a `@state` shader: the `HS_STATE_PASS` program and its
+/// ping-pong state textures. Owned by the `Renderer` next to the image
+/// program it belongs to (and moved into the crossfade with it).
+struct StateSim {
+    program: glow::Program,
+    uniforms: UniformLocations,
+    buffers: FeedbackBuffers,
+    size: StateSize,
+    clock: SimClock,
+}
+
+impl StateSim {
+    /// Binding for the image pass: the latest state.
+    fn binding(&self) -> StateBinding {
+        let front = self.buffers.front();
+        StateBinding {
+            texture: front.texture,
+            size: [front.width, front.height],
+            dt: self.clock.last_dt as f32,
+            step: self.clock.step as i32,
+            pass: 0,
+            sim_time: self.clock.sim_time as f32,
+        }
+    }
+
+    /// Clear the state and restart from step 0 (the seed step).
+    fn reset(&mut self, gl: &glow::Context) {
+        self.buffers.clear(gl);
+        self.clock.reset();
+    }
+
+    /// Reallocate (and reseed) a `Scale` state for a new output size.
+    /// `Fixed` states keep their contents.
+    fn fit_output(&mut self, gl: &glow::Context, output: [u32; 2], max: u32) {
+        if !matches!(self.size, StateSize::Scale(_)) {
+            return;
+        }
+        let [w, h] = state_size(self.size, output, max);
+        let front = self.buffers.front();
+        if [front.width, front.height] == [w, h] {
+            return;
+        }
+        match self.buffers.try_resize(gl, w, h) {
+            Ok(()) => self.clock.reset(),
+            Err(e) => log::error!("state texture resize to {w}x{h} failed: {e:#}"),
+        }
+    }
+
+    fn destroy(self, gl: &glow::Context) {
+        unsafe { gl.delete_program(self.program) };
+        self.buffers.destroy(gl);
     }
 }
 
@@ -904,6 +1128,27 @@ pub struct Renderer {
     /// Present pass that puts the feedback front buffer on screen with the
     /// fade alpha applied. Compiled lazily on first use.
     present: Option<PresentPass>,
+
+    // ------------------------------------------------------------------
+    // State pass (`@state` shaders)
+    // ------------------------------------------------------------------
+    /// State pass of the current program, if it defines `mainState`.
+    sim: Option<StateSim>,
+    /// State pass of the outgoing program during a crossfade. Keeps
+    /// stepping until the transition completes.
+    outgoing_sim: Option<StateSim>,
+    /// Time of the previous `render()`, for the f64 frame `dt` of the state
+    /// sims. `None` after a load, so the first frame has `dt = 0`.
+    last_frame: Option<Instant>,
+    /// `time` of the previous `render_offscreen()` call (render-preview).
+    last_offscreen_time: Option<f64>,
+    /// Target frame rate; `1 / nominal_fps` is the prewarm step of
+    /// `hz=frame` sims.
+    nominal_fps: u32,
+    /// Last output size rendered at; sizes `Scale` states on load.
+    output_size: [u32; 2],
+    /// `GL_MAX_TEXTURE_SIZE`, the clamp for state sizes.
+    max_texture_size: u32,
 }
 
 /// Hardcoded GLSL ES 3.20 vertex shader source. Passes UV coordinates (0..1) to the fragment
@@ -976,6 +1221,8 @@ impl Renderer {
         // frame, which is a no-op when dimensions are unchanged, so the FBOs
         // will snap to the real surface size on the first frame.
         let transition = TransitionRenderer::new(&gl, 1, 1, DEFAULT_SHADER_TRANSITION_SECONDS);
+        let max_texture_size =
+            unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) }.max(1) as u32;
 
         Ok(Self {
             gl,
@@ -1000,6 +1247,13 @@ impl Renderer {
             outgoing_seed: 0,
             feedback: None,
             present: None,
+            sim: None,
+            outgoing_sim: None,
+            last_frame: None,
+            last_offscreen_time: None,
+            nominal_fps: 60,
+            output_size: [1, 1],
+            max_texture_size,
         })
     }
 
@@ -1010,33 +1264,13 @@ impl Renderer {
     /// `seed` is uploaded as `u_seed` for this program (0 for deterministic
     /// output, as in `render-preview` and `bench`).
     pub fn load_shader(&mut self, frag_src: &str, seed: u32) -> anyhow::Result<()> {
-        let vert = self.compile_shader(glow::VERTEX_SHADER, VERT_SRC)?;
-        let frag = match self.compile_shader(glow::FRAGMENT_SHADER, frag_src) {
-            Ok(s) => s,
+        let program = self.link_program(frag_src)?;
+        let sim = match self.build_sim(frag_src, program, self.output_size) {
+            Ok(sim) => sim,
             Err(e) => {
-                unsafe { self.gl.delete_shader(vert) };
+                unsafe { self.gl.delete_program(program) };
                 return Err(e);
             }
-        };
-
-        let program = unsafe {
-            let prog = self
-                .gl
-                .create_program()
-                .map_err(|e| anyhow::anyhow!("create program: {e}"))?;
-            self.gl.attach_shader(prog, vert);
-            self.gl.attach_shader(prog, frag);
-            self.gl.link_program(prog);
-
-            self.gl.delete_shader(vert);
-            self.gl.delete_shader(frag);
-
-            if !self.gl.get_program_link_status(prog) {
-                let log = self.gl.get_program_info_log(prog);
-                self.gl.delete_program(prog);
-                return Err(anyhow::anyhow!("shader link error: {log}"));
-            }
-            prog
         };
 
         if let Some(old) = self.program.take() {
@@ -1047,6 +1281,11 @@ impl Renderer {
         self.shader_seed = seed;
         self.refresh_uniform_locations();
         self.reset_feedback();
+        if let Some(old) = std::mem::replace(&mut self.sim, sim) {
+            old.destroy(&self.gl);
+        }
+        self.last_frame = None;
+        self.last_offscreen_time = None;
 
         log::debug!("Shader loaded successfully");
         Ok(())
@@ -1099,32 +1338,15 @@ impl Renderer {
             return self.load_shader(frag_src, seed);
         }
 
-        // --- Compile + link the incoming shader ---
+        // --- Compile + link the incoming shader (and its state pass) ---
         // Done first so a compile error leaves all state untouched.
-        let vert = self.compile_shader(glow::VERTEX_SHADER, VERT_SRC)?;
-        let frag = match self.compile_shader(glow::FRAGMENT_SHADER, frag_src) {
-            Ok(s) => s,
+        let new_program = self.link_program(frag_src)?;
+        let new_sim = match self.build_sim(frag_src, new_program, self.output_size) {
+            Ok(sim) => sim,
             Err(e) => {
-                unsafe { self.gl.delete_shader(vert) };
+                unsafe { self.gl.delete_program(new_program) };
                 return Err(e);
             }
-        };
-        let new_program = unsafe {
-            let prog = self
-                .gl
-                .create_program()
-                .map_err(|e| anyhow::anyhow!("create program: {e}"))?;
-            self.gl.attach_shader(prog, vert);
-            self.gl.attach_shader(prog, frag);
-            self.gl.link_program(prog);
-            self.gl.delete_shader(vert);
-            self.gl.delete_shader(frag);
-            if !self.gl.get_program_link_status(prog) {
-                let log = self.gl.get_program_info_log(prog);
-                self.gl.delete_program(prog);
-                return Err(anyhow::anyhow!("shader link error: {log}"));
-            }
-            prog
         };
 
         // If a transition was already in-flight, release its outgoing program
@@ -1157,6 +1379,14 @@ impl Renderer {
         self.shader_seed = seed;
         self.refresh_uniform_locations();
         self.reset_feedback();
+        // The outgoing image pass keeps sampling (and stepping) its own state
+        // until the crossfade completes; an older outgoing sim is released.
+        let outgoing = std::mem::replace(&mut self.sim, new_sim);
+        if let Some(prev) = std::mem::replace(&mut self.outgoing_sim, outgoing) {
+            prev.destroy(&self.gl);
+        }
+        self.last_frame = None;
+        self.last_offscreen_time = None;
 
         // Kick off the transition state machine. The outgoing program handle
         // stays alive inside `TransitionState::Crossfading` until `tick()`
@@ -1268,6 +1498,9 @@ impl Renderer {
                 unsafe { self.gl.delete_program(prev) };
             }
             self.outgoing_uniforms = UniformLocations::default();
+            if let Some(sim) = self.outgoing_sim.take() {
+                sim.destroy(&self.gl);
+            }
             log::info!("Shader transition complete (outgoing program released)");
             // The outgoing shader may have been the only user of the pair.
             if self.uniforms.u_prev_frame.is_none() {
@@ -1277,6 +1510,19 @@ impl Renderer {
 
         let elapsed = self.start_time.elapsed().as_secs_f32();
         let frame = self.frame;
+
+        // State sims step before either draw path, so crossfades sample the
+        // current state on both sides.
+        let now = Instant::now();
+        let frame_dt = self
+            .last_frame
+            .map_or(0.0, |t| now.duration_since(t).as_secs_f64());
+        self.last_frame = Some(now);
+        self.output_size = [width, height];
+        if self.sim.is_some() || self.outgoing_sim.is_some() {
+            let start = self.shader_start_elapsed;
+            self.advance_sims(frame_dt, true, resolution, elapsed, start, frame);
+        }
 
         // Feedback shaders need their ping-pong pair at the current size
         // before either draw path runs.
@@ -1317,6 +1563,7 @@ impl Renderer {
                     frame,
                     prev,
                     1.0,
+                    None,
                 );
                 if let Some(fb) = self.feedback.as_mut() {
                     fb.swap();
@@ -1341,6 +1588,7 @@ impl Renderer {
                     frame,
                     None,
                     self.alpha,
+                    self.sim.as_ref().map(StateSim::binding),
                 );
             }
         } else {
@@ -1402,6 +1650,7 @@ impl Renderer {
             frame,
             prev,
             self.alpha,
+            self.outgoing_sim.as_ref().map(StateSim::binding),
         );
 
         // ---- Incoming → fbo_b ----
@@ -1420,6 +1669,7 @@ impl Renderer {
             frame,
             prev,
             self.alpha,
+            self.sim.as_ref().map(StateSim::binding),
         );
 
         // Keep the incoming feedback shader's history flowing: copy its
@@ -1473,6 +1723,9 @@ impl Renderer {
     /// `prev` is bound to texture unit 3 as `u_prev_frame` when the program
     /// samples it; `alpha` is uploaded as `u_alpha` (feedback passes send
     /// `1.0` and apply the fade when presenting instead).
+    ///
+    /// `state` is bound to texture unit 4 as `u_state`, with the other state
+    /// uniforms, when the program declares them (`@state` shaders).
     #[allow(clippy::too_many_arguments)]
     fn draw_program_with(
         &self,
@@ -1485,6 +1738,7 @@ impl Renderer {
         frame: u64,
         prev: Option<glow::Texture>,
         alpha: f32,
+        state: Option<StateBinding>,
     ) {
         unsafe {
             self.gl.use_program(Some(program));
@@ -1549,6 +1803,31 @@ impl Renderer {
                 self.gl.bind_texture(glow::TEXTURE_2D, prev);
                 self.gl.uniform_1_i32(Some(loc), 3);
             }
+            // Texture unit 4 → u_state (`@state` shaders only)
+            if let Some(ref loc) = uniforms.u_state {
+                self.gl.active_texture(glow::TEXTURE0 + STATE_TEXTURE_UNIT);
+                self.gl
+                    .bind_texture(glow::TEXTURE_2D, state.map(|s| s.texture));
+                self.gl.uniform_1_i32(Some(loc), STATE_TEXTURE_UNIT as i32);
+            }
+            if let Some(st) = state {
+                if let Some(ref loc) = uniforms.u_state_resolution {
+                    self.gl
+                        .uniform_2_f32(Some(loc), st.size[0] as f32, st.size[1] as f32);
+                }
+                if let Some(ref loc) = uniforms.u_dt {
+                    self.gl.uniform_1_f32(Some(loc), st.dt);
+                }
+                if let Some(ref loc) = uniforms.u_step {
+                    self.gl.uniform_1_i32(Some(loc), st.step);
+                }
+                if let Some(ref loc) = uniforms.u_pass {
+                    self.gl.uniform_1_i32(Some(loc), st.pass);
+                }
+                if let Some(ref loc) = uniforms.u_sim_time {
+                    self.gl.uniform_1_f32(Some(loc), st.sim_time);
+                }
+            }
             // Reset active texture unit to 0
             self.gl.active_texture(glow::TEXTURE0);
 
@@ -1562,6 +1841,23 @@ impl Renderer {
     pub fn reset_time(&mut self) {
         self.start_time = Instant::now();
         self.shader_start_elapsed = 0.0;
+        self.reset_state();
+    }
+
+    /// Reseed the current shader's state sim (`u_step` back to 0). No-op for
+    /// ordinary shaders.
+    pub fn reset_state(&mut self) {
+        if let Some(sim) = self.sim.as_mut() {
+            sim.reset(&self.gl);
+        }
+        self.last_frame = None;
+        self.last_offscreen_time = None;
+    }
+
+    /// Target frame rate (default 60). Sets the prewarm step of `hz=frame`
+    /// state shaders; the daemon passes its configured `fps`.
+    pub fn set_nominal_fps(&mut self, fps: u32) {
+        self.nominal_fps = fps.max(1);
     }
 
     /// Return a reference to the underlying glow context.
@@ -1579,28 +1875,41 @@ impl Renderer {
         let size: u32 = 64;
 
         // Compile temp program
-        let vert = self.compile_shader(glow::VERTEX_SHADER, VERT_SRC).ok()?;
-        let frag = match self.compile_shader(glow::FRAGMENT_SHADER, frag_src) {
-            Ok(f) => f,
-            Err(_) => {
-                unsafe { self.gl.delete_shader(vert) };
-                return None;
-            }
-        };
+        let prog = self.link_program(frag_src).ok()?;
 
-        let prog = unsafe {
-            let p = self.gl.create_program().ok()?;
-            self.gl.attach_shader(p, vert);
-            self.gl.attach_shader(p, frag);
-            self.gl.link_program(p);
-            self.gl.delete_shader(vert);
-            self.gl.delete_shader(frag);
-            if !self.gl.get_program_link_status(p) {
-                self.gl.delete_program(p);
+        // `@state` shaders: a temporary sim at the nominal 480×270 output,
+        // stepped up to `time` (at most THUMBNAIL_MAX_STEPS), seed 0.
+        let mut sim = match self.build_sim(frag_src, prog, THUMBNAIL_STATE_OUTPUT) {
+            Ok(sim) => sim,
+            Err(e) => {
+                log::debug!("thumbnail: state pass failed: {e:#}");
+                unsafe { self.gl.delete_program(prog) };
                 return None;
             }
-            p
         };
+        if let Some(sim) = sim.as_mut() {
+            let nominal_dt = 1.0 / f64::from(self.nominal_fps.max(1));
+            let (steps, step_dt) = match sim.clock.rate {
+                Rate::PerFrame => (1, nominal_dt),
+                Rate::Hz(hz) => (
+                    ((f64::from(hz) * f64::from(time)).ceil() as u32).clamp(1, THUMBNAIL_MAX_STEPS),
+                    1.0 / f64::from(hz),
+                ),
+            };
+            let warm = std::mem::take(&mut sim.clock.prewarm_left);
+            let warm_dt = match sim.clock.rate {
+                Rate::PerFrame => nominal_dt,
+                Rate::Hz(_) => step_dt,
+            };
+            let plan = StepPlan {
+                warm,
+                steps,
+                warm_dt,
+                step_dt,
+            };
+            let output = THUMBNAIL_STATE_OUTPUT.map(|v| v as f32);
+            self.run_steps(sim, plan, output, time, 0.0, 0, 0);
+        }
 
         // Create temp FBO
         let fbo = unsafe { self.gl.create_framebuffer().ok()? };
@@ -1656,6 +1965,7 @@ impl Renderer {
             0,
             None,
             1.0,
+            sim.as_ref().map(StateSim::binding),
         );
 
         // Read pixels
@@ -1688,6 +1998,9 @@ impl Renderer {
             self.gl.delete_framebuffer(fbo);
             self.gl.delete_texture(tex);
             self.gl.delete_program(prog);
+        }
+        if let Some(sim) = sim {
+            sim.destroy(&self.gl);
         }
 
         Some(pixels)
@@ -1728,7 +2041,7 @@ impl Renderer {
         if self.program.is_none() {
             anyhow::bail!("render_and_capture: no shader program loaded");
         }
-        self.render_offscreen(fbo, resolution, time, frame);
+        self.render_offscreen(fbo, resolution, time, frame, None);
 
         unsafe {
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
@@ -1756,18 +2069,42 @@ impl Renderer {
     ///
     /// Used by `render-preview` (followed by a readback) and by `bench`
     /// (followed by [`Renderer::finish`]). A no-op when no program is loaded.
+    ///
+    /// State sims step by `sim_dt` per call when given (`bench`: `1 / fps`,
+    /// clamped and capped like live frames), otherwise by the `time`
+    /// difference to the previous call (`render-preview`: unclamped, so the
+    /// sim runs at real speed at any preview fps). Time going backwards
+    /// reseeds the sim.
     pub fn render_offscreen(
         &mut self,
         fbo: glow::Framebuffer,
         resolution: [u32; 2],
         time: f32,
         frame: u64,
+        sim_dt: Option<f64>,
     ) {
         let [w, h] = resolution;
         let Some(program) = self.program else {
             return;
         };
         let res_f = [w as f32, h as f32];
+        self.output_size = [w, h];
+        if self.sim.is_some() {
+            let (frame_dt, live) = match sim_dt {
+                Some(dt) => (dt, true),
+                None => {
+                    let t = f64::from(time);
+                    let dt = t - self.last_offscreen_time.unwrap_or(t);
+                    self.last_offscreen_time = Some(t);
+                    if dt < 0.0 {
+                        self.reset_state();
+                    }
+                    (dt.max(0.0), false)
+                }
+            };
+            // Same start as the image pass below: the state pass sees u_time == time.
+            self.advance_sims(frame_dt, live, res_f, time, 0.0, frame);
+        }
         // Pass `time` as `elapsed` with `shader_start_elapsed = 0.0` so
         // u_time == time exactly (explicit frame time, not wall clock).
         let uniforms = self.uniforms.clone();
@@ -1781,7 +2118,9 @@ impl Renderer {
             }
             unsafe { self.gl.clear(glow::COLOR_BUFFER_BIT) };
             let seed = self.shader_seed;
-            self.draw_program_with(program, &uniforms, res_f, time, 0.0, seed, frame, prev, 1.0);
+            self.draw_program_with(
+                program, &uniforms, res_f, time, 0.0, seed, frame, prev, 1.0, None,
+            );
             if let Some(fb) = self.feedback.as_mut() {
                 fb.swap();
             }
@@ -1806,6 +2145,7 @@ impl Renderer {
             frame,
             None,
             self.alpha,
+            self.sim.as_ref().map(StateSim::binding),
         );
         unsafe {
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
@@ -1840,6 +2180,12 @@ impl Renderer {
 
         if let Some(fb) = self.feedback.take() {
             fb.destroy(&self.gl);
+        }
+        for sim in [self.sim.take(), self.outgoing_sim.take()]
+            .into_iter()
+            .flatten()
+        {
+            sim.destroy(&self.gl);
         }
         if let Some(p) = self.present.take() {
             unsafe { self.gl.delete_program(p.program) };
@@ -2070,6 +2416,181 @@ impl Renderer {
     }
 
     /// Compile a single shader stage. Returns the shader object or an error with the info log.
+    /// Compile `frag_src` with the fullscreen-quad vertex shader and link
+    /// them. Nothing is installed; the caller owns the returned program.
+    fn link_program(&self, frag_src: &str) -> anyhow::Result<glow::Program> {
+        let vert = self.compile_shader(glow::VERTEX_SHADER, VERT_SRC)?;
+        let frag = match self.compile_shader(glow::FRAGMENT_SHADER, frag_src) {
+            Ok(s) => s,
+            Err(e) => {
+                unsafe { self.gl.delete_shader(vert) };
+                return Err(e);
+            }
+        };
+        unsafe {
+            let prog = match self.gl.create_program() {
+                Ok(p) => p,
+                Err(e) => {
+                    self.gl.delete_shader(vert);
+                    self.gl.delete_shader(frag);
+                    anyhow::bail!("create program: {e}");
+                }
+            };
+            self.gl.attach_shader(prog, vert);
+            self.gl.attach_shader(prog, frag);
+            self.gl.link_program(prog);
+            self.gl.delete_shader(vert);
+            self.gl.delete_shader(frag);
+            if !self.gl.get_program_link_status(prog) {
+                let log = self.gl.get_program_info_log(prog);
+                self.gl.delete_program(prog);
+                anyhow::bail!("shader link error: {log}");
+            }
+            Ok(prog)
+        }
+    }
+
+    /// Build the state pass of `frag_src` when it defines `mainState`:
+    /// compile the `HS_STATE_PASS` variant and allocate its state textures,
+    /// sized for `output`. `Ok(None)` for ordinary shaders.
+    ///
+    /// Errors (all of which fail the shader load): an invalid spec, a state
+    /// compile error, a state format the driver cannot render to, or a
+    /// shader that also samples `u_prev_frame` in either pass.
+    fn build_sim(
+        &self,
+        frag_src: &str,
+        image_program: glow::Program,
+        output: [u32; 2],
+    ) -> anyhow::Result<Option<StateSim>> {
+        let Some(spec) = crate::shaders::state_spec(frag_src)? else {
+            return Ok(None);
+        };
+        let program = self
+            .link_program(&crate::shaders::with_state_pass_define(frag_src))
+            .map_err(|e| anyhow::anyhow!("state pass: {e:#}"))?;
+        let uniforms = unsafe { UniformLocations::from_program(&self.gl, program) };
+        let image_prev = unsafe { self.gl.get_uniform_location(image_program, "u_prev_frame") };
+        if uniforms.u_prev_frame.is_some() || image_prev.is_some() {
+            unsafe { self.gl.delete_program(program) };
+            anyhow::bail!(
+                "`mainState` shaders cannot sample `u_prev_frame`; keep history in `u_state`"
+            );
+        }
+        let [w, h] = state_size(spec.size, output, self.max_texture_size);
+        let buffers = match FeedbackBuffers::new_with(&self.gl, w, h, spec.format) {
+            Ok(b) => b,
+            Err(e) => {
+                unsafe { self.gl.delete_program(program) };
+                return Err(e.context(format!("state texture ({:?})", spec.format)));
+            }
+        };
+        log::debug!(
+            "State pass built ({w}x{h}, {:?}, {:?})",
+            spec.format,
+            spec.rate
+        );
+        Ok(Some(StateSim {
+            program,
+            uniforms,
+            buffers,
+            size: spec.size,
+            clock: SimClock::new(spec.rate, spec.prewarm),
+        }))
+    }
+
+    /// Run `plan` on `sim`: one state-pass draw per step, each reading
+    /// `front` and writing `back`, then swapping. Leaves the default
+    /// framebuffer bound with the viewport at `resolution`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_steps(
+        &self,
+        sim: &mut StateSim,
+        plan: StepPlan,
+        resolution: [f32; 2],
+        elapsed: f32,
+        shader_start_elapsed: f32,
+        seed: u32,
+        frame: u64,
+    ) {
+        if plan.warm + plan.steps == 0 {
+            return;
+        }
+        for i in 0..plan.warm + plan.steps {
+            let dt = if i < plan.warm {
+                plan.warm_dt
+            } else {
+                plan.step_dt
+            };
+            // No clear: every state pass rewrites every texel.
+            sim.buffers.back().bind(&self.gl);
+            let binding = StateBinding {
+                dt: dt as f32,
+                pass: 0,
+                ..sim.binding()
+            };
+            self.draw_program_with(
+                sim.program,
+                &sim.uniforms,
+                resolution,
+                elapsed,
+                shader_start_elapsed,
+                seed,
+                frame,
+                None,
+                1.0,
+                Some(binding),
+            );
+            sim.buffers.swap();
+            sim.clock.record(dt);
+        }
+        OffscreenTarget::unbind(&self.gl);
+        unsafe {
+            self.gl
+                .viewport(0, 0, resolution[0] as i32, resolution[1] as i32);
+        }
+    }
+
+    /// Fit both state sims to the output and advance them by `frame_dt`.
+    /// `shader_start` is the current program's `shader_start_elapsed`, as
+    /// passed to its image pass; the outgoing sim keeps its own.
+    fn advance_sims(
+        &mut self,
+        frame_dt: f64,
+        live: bool,
+        resolution: [f32; 2],
+        elapsed: f32,
+        shader_start: f32,
+        frame: u64,
+    ) {
+        let output = [resolution[0] as u32, resolution[1] as u32];
+        let nominal_dt = 1.0 / f64::from(self.nominal_fps.max(1));
+        for outgoing in [false, true] {
+            let slot = if outgoing {
+                &mut self.outgoing_sim
+            } else {
+                &mut self.sim
+            };
+            let Some(mut sim) = slot.take() else {
+                continue;
+            };
+            sim.fit_output(&self.gl, output, self.max_texture_size);
+            let plan = sim.clock.plan(frame_dt, live, nominal_dt);
+            let (start, seed) = if outgoing {
+                (self.outgoing_start_elapsed, self.outgoing_seed)
+            } else {
+                (shader_start, self.shader_seed)
+            };
+            self.run_steps(&mut sim, plan, resolution, elapsed, start, seed, frame);
+            let slot = if outgoing {
+                &mut self.outgoing_sim
+            } else {
+                &mut self.sim
+            };
+            *slot = Some(sim);
+        }
+    }
+
     fn compile_shader(&self, stage: u32, source: &str) -> anyhow::Result<glow::NativeShader> {
         unsafe {
             let shader = self
@@ -2119,6 +2640,128 @@ impl Drop for Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NOMINAL: f64 = 1.0 / 30.0;
+
+    /// Run one frame of `clock` and record its steps; returns the plan.
+    fn frame(clock: &mut SimClock, dt: f64, live: bool) -> StepPlan {
+        let plan = clock.plan(dt, live, NOMINAL);
+        for i in 0..plan.warm + plan.steps {
+            clock.record(if i < plan.warm {
+                plan.warm_dt
+            } else {
+                plan.step_dt
+            });
+        }
+        plan
+    }
+
+    #[test]
+    fn test_sim_fixed_rate_steps_and_cap() {
+        let mut c = SimClock::new(Rate::Hz(720.0), 0);
+        frame(&mut c, 0.0, true); // seed step
+        assert_eq!(frame(&mut c, 1.0 / 30.0, true).steps, 24);
+        // A 1 s frame (DPMS off) is clamped to MAX_FRAME_DT: 48 steps, not 720.
+        assert_eq!(frame(&mut c, 1.0, true).steps, 48);
+        // The dropped backlog is not caught up on the next frame.
+        assert!(frame(&mut c, 1.0 / 30.0, true).steps <= 25);
+    }
+
+    #[test]
+    fn test_sim_negative_dt_clamped() {
+        let mut c = SimClock::new(Rate::Hz(60.0), 0);
+        frame(&mut c, 0.0, true);
+        assert_eq!(frame(&mut c, -5.0, true).steps, 0);
+        assert_eq!(frame(&mut c, -5.0, false).steps, 0);
+        let mut p = SimClock::new(Rate::PerFrame, 0);
+        frame(&mut p, 0.0, true);
+        let plan = frame(&mut p, -1.0, true);
+        assert_eq!((plan.steps, plan.step_dt), (1, 0.0));
+    }
+
+    #[test]
+    fn test_sim_per_frame_steps_once() {
+        let mut c = SimClock::new(Rate::PerFrame, 0);
+        for dt in [0.0, 0.01, 0.5, 2.0] {
+            assert_eq!(frame(&mut c, dt, true).steps, 1);
+        }
+        // Live clamps the u_dt handed to the shader.
+        assert_eq!(frame(&mut c, 2.0, true).step_dt, MAX_FRAME_DT);
+        assert_eq!(frame(&mut c, 2.0, false).step_dt, 2.0);
+    }
+
+    #[test]
+    fn test_sim_first_frame_seeds() {
+        let mut c = SimClock::new(Rate::Hz(10.0), 0);
+        assert_eq!(frame(&mut c, 0.0, true).steps, 1);
+        assert_eq!(c.step, 1);
+        // Later zero-length frames don't step.
+        assert_eq!(frame(&mut c, 0.0, true).steps, 0);
+        c.reset();
+        assert_eq!((c.step, c.sim_time), (0, 0.0));
+        assert_eq!(frame(&mut c, 0.0, true).steps, 1);
+    }
+
+    #[test]
+    fn test_sim_offline_neither_clamps_nor_caps() {
+        let mut c = SimClock::new(Rate::Hz(720.0), 0);
+        frame(&mut c, 0.0, false);
+        assert_eq!(frame(&mut c, 1.0, false).steps, 720);
+        let mut c = SimClock::new(Rate::Hz(720.0), 600);
+        assert_eq!(frame(&mut c, 0.0, false).warm, 600);
+    }
+
+    #[test]
+    fn test_sim_prewarm_spread() {
+        // Live Hz: at most one cap of prewarm per frame.
+        let mut c = SimClock::new(Rate::Hz(720.0), 100);
+        let warms: Vec<u32> = (0..4)
+            .map(|_| frame(&mut c, 1.0 / 30.0, true).warm)
+            .collect();
+        assert_eq!(warms, [48, 48, 4, 0]);
+        // Live PerFrame: 4 per frame at the nominal dt.
+        let mut c = SimClock::new(Rate::PerFrame, 10);
+        let plan = frame(&mut c, 0.001, true);
+        assert_eq!((plan.warm, plan.warm_dt), (4, NOMINAL));
+        let total: u32 = 4 + (0..5).map(|_| frame(&mut c, 0.001, true).warm).sum::<u32>();
+        assert_eq!(total, 10);
+    }
+
+    #[test]
+    fn test_sim_no_drift() {
+        let mut c = SimClock::new(Rate::Hz(720.0), 0);
+        let mut t = 0.0;
+        for i in 0..100_000 {
+            // Jittery frames around 60 fps, all below the clamp.
+            let dt = 1.0 / 60.0 + if i % 3 == 0 { 0.004 } else { -0.002 };
+            frame(&mut c, dt, true);
+            t += dt;
+        }
+        let expected = t * 720.0;
+        assert!(
+            (f64::from(c.step) - expected).abs() <= 1.0,
+            "{} vs {expected}",
+            c.step
+        );
+        assert!((c.sim_time - t).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_state_size() {
+        assert_eq!(
+            state_size(StateSize::Scale(0.5), [1920, 1200], 16384),
+            [960, 600]
+        );
+        assert_eq!(
+            state_size(StateSize::Fixed(64, 32), [1920, 1200], 16384),
+            [64, 32]
+        );
+        assert_eq!(
+            state_size(StateSize::Fixed(99999, 8), [1, 1], 4096),
+            [4096, 8]
+        );
+        assert_eq!(state_size(StateSize::Scale(0.5), [1, 1], 4096), [1, 1]);
+    }
 
     #[test]
     fn test_fps_to_interval_ms() {

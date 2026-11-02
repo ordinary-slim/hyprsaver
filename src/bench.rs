@@ -164,6 +164,10 @@ pub fn run(
         .update_lut_a(&lut)
         .context("failed to upload palette LUT")?;
     renderer.set_blend(0.0);
+    renderer.set_nominal_fps(fps);
+    // State shaders step a fixed 1 / fps per frame, as live: stepping on the
+    // sparse sample times below would hit the per-frame cap every frame.
+    let sim_dt = Some(1.0 / f64::from(fps));
 
     eprintln!(
         "bench: {renderer_name}; {width}x{height} × {} monitor(s) @ {fps} fps \
@@ -201,14 +205,16 @@ pub fn run(
         let step = args.span.max(0.001) / frames as f32;
         for f in 0..args.warmup {
             let t = (f % frames) as f32 * step;
-            renderer.render_offscreen(fbo.fbo, [width, height], t, u64::from(f));
+            renderer.render_offscreen(fbo.fbo, [width, height], t, u64::from(f), sim_dt);
         }
+        // Time the steady state from a fresh seed, like a live load.
+        renderer.reset_state();
         renderer.finish();
 
         let start = Instant::now();
         for f in 0..frames {
             let frame = u64::from(args.warmup + f);
-            renderer.render_offscreen(fbo.fbo, [width, height], f as f32 * step, frame);
+            renderer.render_offscreen(fbo.fbo, [width, height], f as f32 * step, frame, sim_dt);
         }
         renderer.finish();
         let frame_ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(frames);

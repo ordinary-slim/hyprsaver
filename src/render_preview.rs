@@ -211,6 +211,7 @@ pub fn run(
     let (gl, _egl_ctx) =
         crate::headless_egl::init().context("failed to initialise headless EGL context")?;
     let mut renderer = Renderer::new(gl).context("failed to create renderer")?;
+    renderer.set_nominal_fps(u32::try_from(fps).unwrap_or(u32::MAX));
     let fbo = OffscreenTarget::new(renderer.gl(), width, height);
 
     let total = shaders_to_render.len();
