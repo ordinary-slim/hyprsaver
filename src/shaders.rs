@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use crate::cycle::PlaylistCursor;
+use crate::renderer::TargetFormat;
 
 // ---------------------------------------------------------------------------
 // Built-in shaders compiled into the binary
@@ -718,6 +719,168 @@ impl ShaderManager {
 // Shader preparation pipeline
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Stateful shaders: `// @state` directive
+// ---------------------------------------------------------------------------
+
+/// Size of a shader's state texture.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StateSize {
+    /// Output size × factor; reallocated and reseeded on resize.
+    Scale(f32),
+    /// Fixed size in texels; survives resize.
+    Fixed(u32, u32),
+}
+
+/// How often the state pass runs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Rate {
+    /// Fixed simulation rate, in steps per second.
+    Hz(f32),
+    /// Exactly one step per rendered frame.
+    PerFrame,
+}
+
+/// Parsed `// @state` directive of a shader that defines `void mainState`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StateSpec {
+    pub size: StateSize,
+    pub rate: Rate,
+    pub passes: u32,
+    pub prewarm: u32,
+    pub format: TargetFormat,
+}
+
+impl Default for StateSpec {
+    fn default() -> Self {
+        Self {
+            size: StateSize::Scale(0.5),
+            rate: Rate::Hz(60.0),
+            passes: 1,
+            prewarm: 0,
+            format: TargetFormat::Rgba16f,
+        }
+    }
+}
+
+/// Highest accepted `hz=`. The live step cap is `hz × MAX_FRAME_DT` per
+/// frame, so an unbounded rate could stall the render loop.
+const MAX_STATE_HZ: f32 = 2000.0;
+
+/// Defined at the top of the state-pass compile of a `@state` shader, so the
+/// generated `main()` calls `mainState` instead of `mainImage`.
+pub const STATE_PASS_DEFINE: &str = "#define HS_STATE_PASS";
+
+/// Parse the stateful-shader spec of `src` (raw or prepared source).
+///
+/// `Ok(None)` when the shader has no `void mainState`. A `// @state` line
+/// without `mainState` is ignored with a warning. Invalid values warn and
+/// fall back to their default; an unsupported `format` and `mainState`
+/// without `mainImage` are errors, since neither can be rendered as written.
+pub fn state_spec(src: &str) -> anyhow::Result<Option<StateSpec>> {
+    let directive = src.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("//")
+            .map(str::trim_start)
+            .and_then(|r| r.strip_prefix("@state"))
+            .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+    });
+
+    if !src.contains("void mainState") {
+        if directive.is_some() {
+            log::warn!("`// @state` directive without `void mainState`; ignored");
+        }
+        return Ok(None);
+    }
+    if !src.contains("void mainImage") {
+        anyhow::bail!("`void mainState` requires a Shadertoy-style `void mainImage`");
+    }
+
+    let mut spec = StateSpec::default();
+    let mut size = None;
+    let mut scale = None;
+    for item in directive.unwrap_or("").split_whitespace() {
+        let Some((key, value)) = item.split_once('=') else {
+            log::warn!("@state: ignoring `{item}` (expected key=value)");
+            continue;
+        };
+        match key {
+            "size" => match parse_size(value) {
+                Some(s) => size = Some(s),
+                None => log::warn!("@state: invalid size `{value}` (expected WxH)"),
+            },
+            "scale" => match value.parse::<f32>() {
+                Ok(s) if s.is_finite() && s > 0.0 => scale = Some(s),
+                _ => log::warn!("@state: invalid scale `{value}`; using 0.5"),
+            },
+            "hz" => match value {
+                "frame" => spec.rate = Rate::PerFrame,
+                _ => match value.parse::<f32>() {
+                    Ok(h) if h.is_finite() && h > 0.0 && h <= MAX_STATE_HZ => {
+                        spec.rate = Rate::Hz(h)
+                    }
+                    _ => log::warn!(
+                        "@state: invalid hz `{value}` (expected `frame` or 0 < hz <= \
+                         {MAX_STATE_HZ}); using 60"
+                    ),
+                },
+            },
+            "passes" => match value.parse::<u32>() {
+                Ok(1) => {}
+                Ok(n) if n > 1 => log::warn!("@state: passes={n} is not supported yet; using 1"),
+                _ => log::warn!("@state: invalid passes `{value}`; using 1"),
+            },
+            "prewarm" => match value.parse::<u32>() {
+                Ok(0) => {}
+                Ok(n) => log::warn!("@state: prewarm={n} is not supported yet; using 0"),
+                _ => log::warn!("@state: invalid prewarm `{value}`; using 0"),
+            },
+            "format" => {
+                spec.format = match value {
+                    "rgba16f" => TargetFormat::Rgba16f,
+                    "rgba32f" => TargetFormat::Rgba32f,
+                    _ => anyhow::bail!(
+                        "@state: unsupported format `{value}` (expected rgba16f or rgba32f)"
+                    ),
+                }
+            }
+            _ => log::warn!("@state: unknown key `{key}`"),
+        }
+    }
+    spec.size = match (size, scale) {
+        (Some((w, h)), _) => StateSize::Fixed(w, h),
+        (None, Some(s)) => StateSize::Scale(s),
+        (None, None) => spec.size,
+    };
+    Ok(Some(spec))
+}
+
+fn parse_size(value: &str) -> Option<(u32, u32)> {
+    let (w, h) = value.split_once('x')?;
+    let (w, h) = (w.parse::<u32>().ok()?, h.parse::<u32>().ok()?);
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+/// Insert [`STATE_PASS_DEFINE`] right after the `#version` line of a
+/// prepared shader (`#version` must stay the first line).
+pub fn with_state_pass_define(src: &str) -> String {
+    let mut out = String::with_capacity(src.len() + STATE_PASS_DEFINE.len() + 1);
+    let mut inserted = false;
+    for line in src.lines() {
+        out.push_str(line);
+        out.push('\n');
+        if !inserted && line.trim_start().starts_with("#version") {
+            out.push_str(STATE_PASS_DEFINE);
+            out.push('\n');
+            inserted = true;
+        }
+    }
+    if !inserted {
+        out.insert_str(0, &format!("{STATE_PASS_DEFINE}\n"));
+    }
+    out
+}
+
 /// Run the full preparation pipeline on a raw shader source string:
 ///
 /// 1. Strip UTF-8 BOM if present.
@@ -726,11 +889,14 @@ impl ShaderManager {
 ///    `u_seed`, `out vec4 fragColor`). Skips each one if already present in the source.
 /// 4. Inject palette uniforms and `palette(t)` function if not already present.
 /// 5. If Shadertoy-style (`void mainImage` detected), add `#define` aliases and a
-///    `void main()` wrapper.
+///    `void main()` wrapper. With `void mainState` (a stateful shader), also
+///    inject the state uniforms; the wrapper then calls `mainState` when
+///    compiled with [`STATE_PASS_DEFINE`] and `mainImage` otherwise.
 fn prepare_shader(raw: &str) -> String {
     let source = raw.strip_prefix('\u{FEFF}').unwrap_or(raw);
 
     let is_shadertoy = source.contains("void mainImage");
+    let is_stateful = source.contains("void mainState");
 
     // ---- split header (#version / precision) from body ----
     let mut header_lines: Vec<&str> = Vec::new();
@@ -798,6 +964,28 @@ fn prepare_shader(raw: &str) -> String {
         }
     }
 
+    // ---- stateful shaders: state texture + simulation uniforms ----
+    // Full-declaration needles, like u_alpha. u_state is the previous state in
+    // the state pass and the current state in the image pass (texture unit 4).
+    const STATE_DECLS: &[(&str, &str)] = &[
+        ("uniform sampler2D u_state", "uniform sampler2D u_state;\n"),
+        (
+            "uniform vec2 u_state_resolution",
+            "uniform vec2 u_state_resolution;\n",
+        ),
+        ("uniform float u_dt", "uniform float u_dt;\n"),
+        ("uniform int u_step", "uniform int u_step;\n"),
+        ("uniform int u_pass", "uniform int u_pass;\n"),
+        ("uniform float u_sim_time", "uniform float u_sim_time;\n"),
+    ];
+    if is_stateful {
+        for (needle, decl) in STATE_DECLS {
+            if !source.contains(needle) {
+                out.push_str(decl);
+            }
+        }
+    }
+
     // ---- inject palette block (if not already present) ----
     // Cosine palettes are pre-baked to 256-sample LUTs on the CPU before upload,
     // so all palette types share the same texture-sampling path on the GPU.
@@ -836,8 +1024,18 @@ fn prepare_shader(raw: &str) -> String {
     if is_shadertoy {
         // Shadertoy: we generate main(), so append alpha multiply directly.
         out.push_str("void main() {\n");
-        out.push_str("    mainImage(fragColor, gl_FragCoord.xy);\n");
-        out.push_str("    fragColor *= u_alpha;\n");
+        if is_stateful {
+            // State is never faded: the state pass skips the alpha multiply.
+            out.push_str("#ifdef HS_STATE_PASS\n");
+            out.push_str("    mainState(fragColor, gl_FragCoord.xy);\n");
+            out.push_str("#else\n");
+            out.push_str("    mainImage(fragColor, gl_FragCoord.xy);\n");
+            out.push_str("    fragColor *= u_alpha;\n");
+            out.push_str("#endif\n");
+        } else {
+            out.push_str("    mainImage(fragColor, gl_FragCoord.xy);\n");
+            out.push_str("    fragColor *= u_alpha;\n");
+        }
         out.push_str("}\n");
     } else {
         // Native shader: rename void main() → _hyprsaver_main(), then wrap it
@@ -1198,6 +1396,121 @@ mod tests {
         let src = "uniform uint u_seed;\nvoid main() { fragColor = vec4(0.0); }";
         let out = prepare_shader(src);
         assert_eq!(out.matches("uniform uint u_seed;").count(), 1);
+    }
+
+    const STATE_BODY: &str = "void mainState(out vec4 o, in vec2 fc) { o = vec4(0.0); }\n\
+                              void mainImage(out vec4 o, in vec2 fc) { o = vec4(1.0); }\n";
+
+    fn spec_with(directive: &str) -> StateSpec {
+        state_spec(&format!("{directive}\n{STATE_BODY}"))
+            .expect("valid spec")
+            .expect("stateful")
+    }
+
+    #[test]
+    fn test_state_spec_defaults_and_trigger() {
+        // mainState alone → all defaults.
+        assert_eq!(spec_with(""), StateSpec::default());
+        // No mainState → not stateful, even with a directive.
+        let src = "// @state size=8x8\nvoid mainImage(out vec4 o, in vec2 fc) { o = vec4(1.0); }";
+        assert_eq!(state_spec(src).unwrap(), None);
+        assert_eq!(state_spec("void main() {}").unwrap(), None);
+    }
+
+    #[test]
+    fn test_state_spec_keys() {
+        let s = spec_with("// @state size=512x128 hz=frame format=rgba32f");
+        assert_eq!(s.size, StateSize::Fixed(512, 128));
+        assert_eq!(s.rate, Rate::PerFrame);
+        assert_eq!(s.format, TargetFormat::Rgba32f);
+
+        let s = spec_with("// @state scale=0.25 hz=720 format=rgba16f");
+        assert_eq!(s.size, StateSize::Scale(0.25));
+        assert_eq!(s.rate, Rate::Hz(720.0));
+        assert_eq!(s.format, TargetFormat::Rgba16f);
+
+        // size wins over scale.
+        assert_eq!(
+            spec_with("// @state scale=0.25 size=4x4").size,
+            StateSize::Fixed(4, 4)
+        );
+        // Not a directive: no whitespace after the tag.
+        assert_eq!(spec_with("// @statesize=4x4"), StateSpec::default());
+    }
+
+    #[test]
+    fn test_state_spec_invalid_values_fall_back() {
+        let s = spec_with("// @state size=0x4 scale=-1 hz=0 passes=0 prewarm=x bogus=1 junk");
+        assert_eq!(s, StateSpec::default());
+        assert_eq!(spec_with("// @state hz=100000").rate, Rate::Hz(60.0));
+        assert_eq!(spec_with("// @state size=12").size, StateSize::Scale(0.5));
+        // Phase 2: passes / prewarm parse but stay at 1 / 0.
+        let s = spec_with("// @state passes=4 prewarm=600");
+        assert_eq!((s.passes, s.prewarm), (1, 0));
+    }
+
+    #[test]
+    fn test_state_spec_errors() {
+        assert!(state_spec(&format!("// @state format=rgba8\n{STATE_BODY}")).is_err());
+        let native = "void mainState(out vec4 o, in vec2 fc) {}\nvoid main() {}";
+        assert!(state_spec(native).is_err());
+    }
+
+    #[test]
+    fn test_state_spec_survives_preparation() {
+        let raw = format!(
+            "#version 320 es\nprecision highp float;\n// @state size=64x64 hz=frame\n{STATE_BODY}"
+        );
+        let prepared = prepare_shader(&raw);
+        let s = state_spec(&prepared).unwrap().unwrap();
+        assert_eq!(s.size, StateSize::Fixed(64, 64));
+        assert_eq!(s.rate, Rate::PerFrame);
+    }
+
+    #[test]
+    fn test_state_uniforms_and_wrapper() {
+        let out = prepare_shader(STATE_BODY);
+        for decl in [
+            "uniform sampler2D u_state;",
+            "uniform vec2 u_state_resolution;",
+            "uniform float u_dt;",
+            "uniform int u_step;",
+            "uniform int u_pass;",
+            "uniform float u_sim_time;",
+        ] {
+            assert_eq!(out.matches(decl).count(), 1, "{decl}");
+        }
+        assert!(
+            out.contains("#ifdef HS_STATE_PASS\n    mainState(fragColor, gl_FragCoord.xy);\n#else")
+        );
+        assert_eq!(out.matches("fragColor *= u_alpha;").count(), 1);
+
+        // Declared by the shader → not duplicated.
+        let src = format!("uniform sampler2D u_state;\n{STATE_BODY}");
+        assert_eq!(
+            prepare_shader(&src)
+                .matches("uniform sampler2D u_state;")
+                .count(),
+            1
+        );
+
+        // Ordinary shaders get none of it.
+        let plain = prepare_shader("void mainImage(out vec4 o, in vec2 fc) { o = vec4(1.0); }");
+        assert!(!plain.contains("u_state") && !plain.contains("HS_STATE_PASS"));
+    }
+
+    #[test]
+    fn test_with_state_pass_define() {
+        let prepared = prepare_shader(STATE_BODY);
+        let state = with_state_pass_define(&prepared);
+        let mut lines = state.lines();
+        assert!(lines.next().unwrap().starts_with("#version"));
+        assert_eq!(lines.next(), Some(STATE_PASS_DEFINE));
+        assert_eq!(state.matches(STATE_PASS_DEFINE).count(), 1);
+        assert_eq!(
+            with_state_pass_define("void main() {}\n").lines().next(),
+            Some(STATE_PASS_DEFINE)
+        );
     }
 
     #[test]
