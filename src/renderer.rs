@@ -39,6 +39,8 @@ pub struct UniformLocations {
     /// Previous frame's colour buffer (texture unit 3). `Some` only for
     /// feedback shaders — GLSL drops the injected sampler when it is unused.
     pub u_prev_frame: Option<glow::UniformLocation>,
+    /// Per-load random seed (`uint`).
+    pub u_seed: Option<glow::UniformLocation>,
 }
 
 impl UniformLocations {
@@ -59,6 +61,7 @@ impl UniformLocations {
             u_speed_scale: gl.get_uniform_location(prog, "u_speed_scale"),
             u_zoom_scale: gl.get_uniform_location(prog, "u_zoom_scale"),
             u_prev_frame: gl.get_uniform_location(prog, "u_prev_frame"),
+            u_seed: gl.get_uniform_location(prog, "u_seed"),
         }
     }
 }
@@ -843,6 +846,12 @@ pub struct Renderer {
     /// transition.
     outgoing_start_elapsed: f32,
 
+    /// `u_seed` of the current program, passed by the caller on load.
+    shader_seed: u32,
+
+    /// `u_seed` of the outgoing program during a crossfade.
+    outgoing_seed: u32,
+
     // ------------------------------------------------------------------
     // Feedback (previous-frame) state
     // ------------------------------------------------------------------
@@ -945,6 +954,8 @@ impl Renderer {
             outgoing_uniforms: UniformLocations::default(),
             shader_start_elapsed: 0.0,
             outgoing_start_elapsed: 0.0,
+            shader_seed: 0,
+            outgoing_seed: 0,
             feedback: None,
             present: None,
         })
@@ -953,7 +964,10 @@ impl Renderer {
     /// Compile and link a new shader program from the given fragment source.
     /// On success replaces `self.program` and refreshes `self.uniforms`.
     /// On compile/link error, logs the error and returns Err — caller decides whether to fallback.
-    pub fn load_shader(&mut self, frag_src: &str) -> anyhow::Result<()> {
+    ///
+    /// `seed` is uploaded as `u_seed` for this program (0 for deterministic
+    /// output, as in `render-preview` and `bench`).
+    pub fn load_shader(&mut self, frag_src: &str, seed: u32) -> anyhow::Result<()> {
         let vert = self.compile_shader(glow::VERTEX_SHADER, VERT_SRC)?;
         let frag = match self.compile_shader(glow::FRAGMENT_SHADER, frag_src) {
             Ok(s) => s,
@@ -988,6 +1002,7 @@ impl Renderer {
         }
         self.program = Some(program);
         self.shader_start_elapsed = self.start_time.elapsed().as_secs_f32();
+        self.shader_seed = seed;
         self.refresh_uniform_locations();
         self.reset_feedback();
 
@@ -1022,6 +1037,9 @@ impl Renderer {
     /// `None`, the transition renderer's configured default is used
     /// ([`DEFAULT_SHADER_TRANSITION_SECONDS`]).
     ///
+    /// `seed` becomes the incoming program's `u_seed`; the outgoing program
+    /// keeps its own seed for the rest of the fade.
+    ///
     /// If no program is currently loaded, or the transition renderer failed
     /// to initialise, this falls back to the normal [`Renderer::load_shader`]
     /// path (instant swap, no crossfade).
@@ -1029,13 +1047,14 @@ impl Renderer {
         &mut self,
         frag_src: &str,
         duration: Option<f32>,
+        seed: u32,
     ) -> anyhow::Result<()> {
         // Nothing to cross-fade from → fall back to the normal swap.
         let Some(outgoing_program) = self.program else {
-            return self.load_shader(frag_src);
+            return self.load_shader(frag_src, seed);
         };
         if self.transition.is_none() {
-            return self.load_shader(frag_src);
+            return self.load_shader(frag_src, seed);
         }
 
         // --- Compile + link the incoming shader ---
@@ -1090,8 +1109,10 @@ impl Renderer {
         // self.uniforms with the incoming program's locations.
         self.outgoing_uniforms = std::mem::take(&mut self.uniforms);
         self.outgoing_start_elapsed = self.shader_start_elapsed;
+        self.outgoing_seed = self.shader_seed;
         self.program = Some(new_program);
         self.shader_start_elapsed = self.start_time.elapsed().as_secs_f32();
+        self.shader_seed = seed;
         self.refresh_uniform_locations();
         self.reset_feedback();
 
@@ -1250,6 +1271,7 @@ impl Renderer {
                     resolution,
                     elapsed,
                     self.shader_start_elapsed,
+                    self.shader_seed,
                     frame,
                     prev,
                     1.0,
@@ -1273,6 +1295,7 @@ impl Renderer {
                     resolution,
                     elapsed,
                     self.shader_start_elapsed,
+                    self.shader_seed,
                     frame,
                     None,
                     self.alpha,
@@ -1333,6 +1356,7 @@ impl Renderer {
             resolution,
             elapsed,
             self.outgoing_start_elapsed,
+            self.outgoing_seed,
             frame,
             prev,
             self.alpha,
@@ -1350,6 +1374,7 @@ impl Renderer {
             resolution,
             elapsed,
             self.shader_start_elapsed,
+            self.shader_seed,
             frame,
             prev,
             self.alpha,
@@ -1400,7 +1425,8 @@ impl Renderer {
     /// `u_time` so that each shader sees time starting near 0.0 on its first
     /// frame.  Pass `self.shader_start_elapsed` for the incoming/normal shader
     /// and `self.outgoing_start_elapsed` for the outgoing shader during a
-    /// crossfade.
+    /// crossfade. `seed` is uploaded as `u_seed` (`self.shader_seed` /
+    /// `self.outgoing_seed` likewise).
     ///
     /// `prev` is bound to texture unit 3 as `u_prev_frame` when the program
     /// samples it; `alpha` is uploaded as `u_alpha` (feedback passes send
@@ -1413,6 +1439,7 @@ impl Renderer {
         resolution: [f32; 2],
         elapsed: f32,
         shader_start_elapsed: f32,
+        seed: u32,
         frame: u64,
         prev: Option<glow::Texture>,
         alpha: f32,
@@ -1433,6 +1460,9 @@ impl Renderer {
             }
             if let Some(ref loc) = uniforms.u_frame {
                 self.gl.uniform_1_i32(Some(loc), frame as i32);
+            }
+            if let Some(ref loc) = uniforms.u_seed {
+                self.gl.uniform_1_u32(Some(loc), seed);
             }
             if let Some(ref loc) = uniforms.u_mouse {
                 self.gl
@@ -1581,6 +1611,7 @@ impl Renderer {
             time,
             0.0,
             0,
+            0,
             None,
             1.0,
         );
@@ -1707,7 +1738,8 @@ impl Renderer {
                 fb.back().bind(&self.gl);
             }
             unsafe { self.gl.clear(glow::COLOR_BUFFER_BIT) };
-            self.draw_program_with(program, &uniforms, res_f, time, 0.0, frame, prev, 1.0);
+            let seed = self.shader_seed;
+            self.draw_program_with(program, &uniforms, res_f, time, 0.0, seed, frame, prev, 1.0);
             if let Some(fb) = self.feedback.as_mut() {
                 fb.swap();
             }
@@ -1723,7 +1755,15 @@ impl Renderer {
             self.gl.clear(glow::COLOR_BUFFER_BIT);
         }
         self.draw_program_with(
-            program, &uniforms, res_f, time, 0.0, frame, None, self.alpha,
+            program,
+            &uniforms,
+            res_f,
+            time,
+            0.0,
+            self.shader_seed,
+            frame,
+            None,
+            self.alpha,
         );
         unsafe {
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);

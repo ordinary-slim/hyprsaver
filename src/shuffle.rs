@@ -151,6 +151,42 @@ pub fn seed_from_time() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Per-load shader seeds
+// ---------------------------------------------------------------------------
+
+/// Source of the `u_seed` shader uniform: hash(process seed, load counter).
+///
+/// One instance per process, shared by all surfaces, so every monitor gets the
+/// same value. Callers take [`ShaderSeeds::next`] once per shader load event
+/// (cycle change, hot-reload) and [`ShaderSeeds::current`] for surfaces that
+/// join mid-run.
+pub struct ShaderSeeds {
+    process: u64,
+    loads: u64,
+}
+
+impl ShaderSeeds {
+    pub fn new(process: u64) -> Self {
+        Self { process, loads: 0 }
+    }
+
+    /// The seed of the most recent load.
+    pub fn current(&self) -> u32 {
+        // splitmix64 finalizer
+        let mut z = self.process ^ self.loads.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        (z ^ (z >> 31)) as u32
+    }
+
+    /// Advance to a new load and return its seed.
+    pub fn next(&mut self) -> u32 {
+        self.loads = self.loads.wrapping_add(1);
+        self.current()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -242,5 +278,26 @@ mod tests {
     #[test]
     fn seed_from_time_nonzero() {
         assert_ne!(seed_from_time(), 0);
+    }
+
+    #[test]
+    fn shader_seeds_deterministic_and_distinct() {
+        let mut a = ShaderSeeds::new(42);
+        let mut b = ShaderSeeds::new(42);
+        assert_eq!(a.current(), a.current());
+        assert_eq!(a.current(), b.current());
+        let first = a.current();
+        assert_ne!(a.next(), first);
+        assert_eq!(b.next(), a.current());
+        assert_ne!(
+            ShaderSeeds::new(43).current(),
+            ShaderSeeds::new(42).current()
+        );
+
+        let mut seen = HashSet::new();
+        let mut s = ShaderSeeds::new(0x2545_f491_4f6c_dd1d);
+        for _ in 0..1000 {
+            assert!(seen.insert(s.next()));
+        }
     }
 }

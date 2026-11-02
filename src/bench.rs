@@ -185,7 +185,7 @@ pub fn run(
             .get(name)
             .map(|s| s.compiled.clone())
             .ok_or_else(|| anyhow::anyhow!("shader '{name}' not found"))?;
-        if let Err(e) = renderer.load_shader(&src) {
+        if let Err(e) = renderer.load_shader(&src, 0) {
             eprintln!(" compile FAILED: {e:#}");
             results.push(BenchResult {
                 name: name.clone(),

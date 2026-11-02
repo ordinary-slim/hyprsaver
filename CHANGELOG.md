@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `u_seed` / `iSeed` shader uniform: a random value per shader load, the same on
+  all monitors and 0 in `render-preview` / `bench`, so shaders no longer replay
+  the same opening on every launch.
+- Preview panel "Lock seed" toggle that keeps `u_seed` across reloads, with the
+  current value shown next to it.
+
 
 ## [0.4.8] - 2026-10-21
 

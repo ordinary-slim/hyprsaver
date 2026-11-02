@@ -57,6 +57,7 @@ use crate::{
     palette::{Palette, PaletteEntry, PaletteManager},
     renderer::Renderer,
     shaders::ShaderManager,
+    shuffle::{seed_from_time, ShaderSeeds},
 };
 
 // Width of the right-side egui control panel in logical pixels.
@@ -224,6 +225,10 @@ struct PreviewPanelState {
     show_fps: bool,
     /// Palette cross-fade transition duration in seconds.
     palette_transition_speed: f32,
+    /// Keep the current `u_seed` across shader loads, so edits can be compared.
+    seed_locked: bool,
+    /// `u_seed` of the loaded shader, shown next to the lock toggle.
+    current_seed: u32,
 }
 
 /// egui resources bundled together so they can be `.take()`n out of
@@ -306,9 +311,27 @@ struct PreviewState {
     /// The palette name thumbnails were last generated for. If the active
     /// palette changes, thumbnails are regenerated.
     thumbnails_palette: String,
+
+    /// `u_seed` source; see `PreviewPanelState::seed_locked`.
+    shader_seeds: ShaderSeeds,
 }
 
 impl PreviewState {
+    /// `u_seed` for the next shader load: unchanged while `locked`, new otherwise.
+    fn load_seed(&mut self, locked: bool) -> u32 {
+        if locked {
+            self.shader_seeds.current()
+        } else {
+            self.shader_seeds.next()
+        }
+    }
+
+    fn seed_locked(&self) -> bool {
+        self.egui_bundle
+            .as_ref()
+            .is_some_and(|b| b.state.seed_locked)
+    }
+
     fn phys_width(&self) -> u32 {
         self.width * self.scale_factor.max(1) as u32
     }
@@ -372,7 +395,7 @@ impl PreviewState {
 
         let mut renderer = Renderer::new(gl).context("Renderer::new failed")?;
         renderer
-            .load_shader(shader_compiled)
+            .load_shader(shader_compiled, self.shader_seeds.current())
             .context("initial shader load failed")?;
         renderer
             .set_palette(palette)
@@ -428,6 +451,8 @@ impl PreviewState {
                         fullscreen_mode: false,
                         show_fps: true,
                         palette_transition_speed: self.config.general.palette_transition_duration,
+                        seed_locked: false,
+                        current_seed: self.shader_seeds.current(),
                     },
                 });
             }
@@ -589,6 +614,7 @@ impl PreviewState {
         let logical_h = phys_h as f32 / scale;
 
         bundle.ctx.set_pixels_per_point(scale);
+        bundle.state.current_seed = self.shader_seeds.current();
 
         let raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -751,8 +777,9 @@ impl PreviewState {
 
             if let Some(src) = self.shader_manager.get_compiled(&sel_shader) {
                 let src = src.to_string();
+                let seed = self.load_seed(bundle.state.seed_locked);
                 if let Some(r) = self.renderer.as_mut() {
-                    match r.load_shader(&src) {
+                    match r.load_shader(&src, seed) {
                         Ok(()) => {
                             self.active_shader = sel_shader.clone();
                             bundle.state.status_message = format!("Loaded '{sel_shader}'");
@@ -922,8 +949,9 @@ impl PreviewState {
                 let next_name = candidates[idx].clone();
                 if let Some(src) = self.shader_manager.get_compiled(&next_name) {
                     let src = src.to_string();
+                    let seed = self.load_seed(bundle.state.seed_locked);
                     if let Some(r) = self.renderer.as_mut() {
-                        match r.start_shader_transition(&src, Some(2.0)) {
+                        match r.start_shader_transition(&src, Some(2.0), seed) {
                             Ok(()) => {
                                 log::info!(
                                     "preview: test transition {} → {}",
@@ -1127,10 +1155,11 @@ impl PreviewState {
                 .egl
                 .make_current(egl.display, Some(es), Some(es), Some(ec));
         }
+        let seed = self.load_seed(self.seed_locked());
         let Some(r) = self.renderer.as_mut() else {
             return;
         };
-        match r.start_shader_transition(&src, Some(2.0)) {
+        match r.start_shader_transition(&src, Some(2.0), seed) {
             Ok(()) => {
                 log::info!("preview: shader transition: {prev_name} → {next_name}");
                 self.active_shader = next_name.clone();
@@ -1167,8 +1196,9 @@ impl PreviewState {
 
         if let Some(src) = self.shader_manager.get_compiled(&next_name) {
             let src = src.to_string();
+            let seed = self.load_seed(self.seed_locked());
             if let Some(r) = self.renderer.as_mut() {
-                if r.load_shader(&src).is_ok() {
+                if r.load_shader(&src, seed).is_ok() {
                     self.active_shader = next_name.clone();
                     if let Some(ref mut bundle) = self.egui_bundle {
                         bundle.state.selected_shader = next_name.clone();
@@ -1279,8 +1309,9 @@ impl PreviewState {
         }
         if let Some(src) = self.shader_manager.get_compiled(&name) {
             let src = src.to_string();
+            let seed = self.load_seed(self.seed_locked());
             if let Some(r) = self.renderer.as_mut() {
-                match r.load_shader(&src) {
+                match r.load_shader(&src, seed) {
                     Ok(()) => log::info!("preview: reloaded shader '{name}'"),
                     Err(e) => log::warn!("preview: shader compile error: {e:#}"),
                 }
@@ -1391,6 +1422,7 @@ pub fn run(
         thumbnail_pixels: std::collections::HashMap::new(),
         thumbnail_textures: std::collections::HashMap::new(),
         thumbnails_palette: active_palette,
+        shader_seeds: ShaderSeeds::new(seed_from_time()),
     };
 
     // Calloop event loop.
@@ -1421,8 +1453,9 @@ pub fn run(
                 if *name == state.active_shader {
                     if let Some(src) = state.shader_manager.get_compiled(name) {
                         let src = src.to_string();
+                        let seed = state.load_seed(state.seed_locked());
                         if let Some(r) = state.renderer.as_mut() {
-                            match r.load_shader(&src) {
+                            match r.load_shader(&src, seed) {
                                 Ok(()) => log::info!("preview: hot-reloaded shader '{name}'"),
                                 Err(e) => log::warn!("preview: hot-reload compile error: {e:#}"),
                             }
@@ -2371,6 +2404,15 @@ fn draw_preview_tab(
                         {
                             state.speed = 1.0;
                         }
+                    });
+
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut state.seed_locked, "Lock seed")
+                            .on_hover_text("Keep u_seed across shader reloads and changes");
+                        ui.label(
+                            egui::RichText::new(format!("{:08x}", state.current_seed)).monospace(),
+                        );
                     });
 
                     ui.add_space(4.0);

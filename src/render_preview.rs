@@ -316,7 +316,7 @@ fn render_shader_to_webp(
     let frag_src = shader_src.compiled.clone();
 
     renderer
-        .load_shader(&frag_src)
+        .load_shader(&frag_src, 0)
         .with_context(|| format!("failed to compile shader '{shader_name}'"))?;
 
     // Pre-compute palette LUTs.

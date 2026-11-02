@@ -723,7 +723,7 @@ impl ShaderManager {
 /// 1. Strip UTF-8 BOM if present.
 /// 2. Extract `#version` / `precision` header lines (kept at the top).
 /// 3. Inject missing common uniforms (`u_time`, `u_resolution`, `u_mouse`, `u_frame`,
-///    `out vec4 fragColor`). Skips each one if already present in the source.
+///    `u_seed`, `out vec4 fragColor`). Skips each one if already present in the source.
 /// 4. Inject palette uniforms and `palette(t)` function if not already present.
 /// 5. If Shadertoy-style (`void mainImage` detected), add `#define` aliases and a
 ///    `void main()` wrapper.
@@ -762,12 +762,15 @@ fn prepare_shader(raw: &str) -> String {
     //   - bare names (u_time .. u_frame): any mention in the source (even just a
     //     usage) suppresses injection, matching long-standing behavior;
     //   - "out vec4 fragColor;" with semicolon: avoids matching function params;
-    //   - full declarations (u_alpha, u_speed_scale, u_zoom_scale, u_prev_frame):
+    //   - full declarations (u_alpha, u_speed_scale, u_zoom_scale, u_prev_frame,
+    //     u_seed):
     //     only an actual declaration suppresses injection, so shaders that merely
     //     *use* these uniforms (or mention them in comments) still get them injected.
     //     u_prev_frame is the previous frame's colour buffer (feedback / ping-pong);
     //     GLSL drops the sampler when unused, so the renderer only allocates the
     //     buffers for shaders that actually reference it.
+    //     u_seed is a per-load random value (same on all monitors, 0 in
+    //     render-preview / bench).
     const INJECTED_DECLS: &[(&str, &str)] = &[
         ("u_time", "uniform float u_time;\n"),
         ("u_resolution", "uniform vec2 u_resolution;\n"),
@@ -787,6 +790,7 @@ fn prepare_shader(raw: &str) -> String {
             "uniform sampler2D u_prev_frame",
             "uniform sampler2D u_prev_frame;\n",
         ),
+        ("uniform uint u_seed", "uniform uint u_seed;\n"),
     ];
     for (needle, decl) in INJECTED_DECLS {
         if !source.contains(needle) {
@@ -817,6 +821,7 @@ fn prepare_shader(raw: &str) -> String {
         out.push_str("#define iResolution u_resolution\n");
         out.push_str("#define iMouse u_mouse\n");
         out.push_str("#define iFrame u_frame\n");
+        out.push_str("#define iSeed u_seed\n");
     }
 
     // ---- user body ----
@@ -1180,6 +1185,27 @@ mod tests {
         // compiler removes the unused sampler, so this costs nothing).
         let out = prepare_shader("void main() { fragColor = vec4(1.0); }");
         assert_eq!(out.matches("uniform sampler2D u_prev_frame;").count(), 1);
+    }
+
+    #[test]
+    fn test_seed_injected_once() {
+        // Used (or mentioned in a comment) but not declared → still injected.
+        let src = "// u_seed salts the hash\nvoid main() { fragColor = vec4(float(u_seed)); }";
+        let out = prepare_shader(src);
+        assert_eq!(out.matches("uniform uint u_seed;").count(), 1);
+
+        // Declared by the shader → not injected again.
+        let src = "uniform uint u_seed;\nvoid main() { fragColor = vec4(0.0); }";
+        let out = prepare_shader(src);
+        assert_eq!(out.matches("uniform uint u_seed;").count(), 1);
+    }
+
+    #[test]
+    fn test_seed_alias_only_for_shadertoy() {
+        let st = prepare_shader("void mainImage(out vec4 o, in vec2 fc) { o = vec4(1.0); }");
+        assert!(st.contains("#define iSeed u_seed"));
+        let native = prepare_shader("void main() { fragColor = vec4(1.0); }");
+        assert!(!native.contains("#define iSeed"));
     }
 
     #[test]

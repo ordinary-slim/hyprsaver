@@ -578,6 +578,10 @@ uniform float u_zoom_scale;
 // Black on the first frame, after a resize, and whenever the shader is loaded.
 uniform sampler2D u_prev_frame;
 
+// Random per shader load, the same on every monitor; 0 in render-preview and
+// bench. Use as a hash salt or time offset: u_time + float(u_seed % 3600u).
+uniform uint u_seed;
+
 out vec4 fragColor;
 
 // Palette helper -- included automatically, always available
@@ -616,6 +620,7 @@ hyprsaver accepts shaders written in Shadertoy's convention. The following remap
 | `iResolution` | `vec3(u_resolution, 0.0)` |
 | `iMouse` | `vec4(u_mouse, 0.0, 0.0)` |
 | `iFrame` | `u_frame` |
+| `iSeed` (hyprsaver extension) | `u_seed` |
 
 If your shader contains `void mainImage(out vec4 fragColor, in vec2 fragCoord)`, a `void main()` wrapper is appended automatically. You can paste most Shadertoy shaders directly (note: `iChannel` texture uniforms are not yet supported -- v1.0.0).
 

@@ -48,6 +48,7 @@ use crate::{
     palette::PaletteManager,
     renderer::Renderer,
     shaders::ShaderManager,
+    shuffle::{seed_from_time, ShaderSeeds},
 };
 
 /// How long a surface waits for an outstanding frame callback before rendering
@@ -226,6 +227,7 @@ impl Surface {
         &mut self,
         egl: &EglState,
         shader_compiled: &str,
+        seed: u32,
         palette: &crate::palette::PaletteEntry,
     ) -> anyhow::Result<()> {
         let w = self.phys_width().max(1) as i32;
@@ -294,7 +296,7 @@ impl Surface {
 
         let mut renderer = Renderer::new(gl).context("Renderer::new failed")?;
         renderer
-            .load_shader(shader_compiled)
+            .load_shader(shader_compiled, seed)
             .context("initial shader load failed")?;
         renderer
             .set_palette(palette)
@@ -462,6 +464,9 @@ pub struct WaylandState {
 
     /// Whether all monitors cycle in sync (`true`, default) or independently (`false`).
     synced: bool,
+
+    /// `u_seed` source, shared by all surfaces so monitors get the same value.
+    shader_seeds: ShaderSeeds,
 }
 
 impl WaylandState {
@@ -794,6 +799,7 @@ pub fn run(
         signal_flag,
         global_cycle_manager,
         synced,
+        shader_seeds: ShaderSeeds::new(seed_from_time()),
     };
 
     // Initial roundtrip to get outputs.
@@ -883,10 +889,11 @@ pub fn run(
             for name in &reloaded {
                 if let Some(src) = state.shader_manager.get_compiled(name) {
                     let src = src.to_string();
+                    let seed = state.shader_seeds.next();
                     for surf in state.surfaces.values_mut() {
                         if surf.shader_name == *name {
                             if let Some(r) = surf.renderer.as_mut() {
-                                if let Err(e) = r.load_shader(&src) {
+                                if let Err(e) = r.load_shader(&src, seed) {
                                     log::warn!("Hot-reload shader compile error: {e:#}");
                                 }
                             }
@@ -918,6 +925,7 @@ pub fn run(
                                 state.shader_manager.get_compiled(&name).map(str::to_string);
                             if let Some(compiled) = compiled {
                                 let old_active = state.active_shader.clone();
+                                let seed = state.shader_seeds.next();
                                 for surf in state.surfaces.values_mut() {
                                     // Skip surfaces with per-monitor pinned shaders.
                                     if surf.shader_name != old_active {
@@ -935,7 +943,7 @@ pub fn run(
                                         );
                                     }
                                     if let Some(r) = surf.renderer.as_mut() {
-                                        if let Err(e) = r.load_shader(&compiled) {
+                                        if let Err(e) = r.load_shader(&compiled, seed) {
                                             log::warn!("Shader cycle compile error: {e:#}");
                                         }
                                     }
@@ -1003,6 +1011,7 @@ pub fn run(
                                     .get_compiled(&shader_name)
                                     .map(str::to_string);
                                 if let Some(compiled) = compiled {
+                                    let seed = state.shader_seeds.next();
                                     if let Some(surf) = state.surfaces.get_mut(key) {
                                         if let (Some(egl), Some(es), Some(ec)) =
                                             (egl_ptr, surf.egl_surface, surf.egl_context)
@@ -1016,7 +1025,7 @@ pub fn run(
                                             );
                                         }
                                         if let Some(r) = surf.renderer.as_mut() {
-                                            if let Err(e) = r.load_shader(&compiled) {
+                                            if let Err(e) = r.load_shader(&compiled, seed) {
                                                 log::warn!("Shader cycle compile error: {e:#}");
                                             }
                                         }
@@ -1435,7 +1444,10 @@ impl LayerShellHandler for WaylandState {
                     .unwrap_or(crate::shaders::BUILTIN_JULIA)
                     .to_string();
 
-                if let Err(e) = surf.init_gl(unsafe { &*egl_ptr }, &shader_compiled, &palette) {
+                // Surfaces that appear mid-run join with the current seed.
+                let seed = self.shader_seeds.current();
+                if let Err(e) = surf.init_gl(unsafe { &*egl_ptr }, &shader_compiled, seed, &palette)
+                {
                     log::error!("Failed to init GL for surface: {e:#}");
                 } else {
                     log::info!(
