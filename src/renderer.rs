@@ -750,6 +750,29 @@ impl StateSim {
         unsafe { gl.delete_program(self.program) };
         self.buffers.destroy(gl);
     }
+
+    /// Read the latest state back as RGBA floats (row-major, bottom row
+    /// first). `RGBA` / `FLOAT` is the readback GLES 3.2 guarantees for
+    /// float colour buffers.
+    #[cfg(test)]
+    fn read_front(&self, gl: &glow::Context) -> Vec<f32> {
+        let f = self.buffers.front();
+        let mut px = vec![0f32; (f.width * f.height * 4) as usize];
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(f.fbo));
+            gl.read_pixels(
+                0,
+                0,
+                f.width as i32,
+                f.height as i32,
+                glow::RGBA,
+                glow::FLOAT,
+                glow::PixelPackData::Slice(bytemuck::cast_slice_mut(&mut px)),
+            );
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+        px
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2858,5 +2881,238 @@ mod tests {
             );
             prev = cur;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GL-backed tests (state pass)
+// ---------------------------------------------------------------------------
+
+/// Need a GL ES 3.2 context: `cargo test -- --ignored`, under llvmpipe on CI
+/// (`LIBGL_ALWAYS_SOFTWARE=1 EGL_PLATFORM=surfaceless`). Failing to create
+/// the context is a hard failure, never a silent pass.
+#[cfg(test)]
+mod gl_tests {
+    use super::*;
+    use crate::shaders::prepare_shader;
+    use std::sync::{Mutex, MutexGuard};
+
+    const LIFE: &str = include_str!("../tests/shaders/life.frag");
+
+    /// `HeadlessContext` terminates the process-wide EGL display on drop, so
+    /// GL tests run one at a time.
+    static GL_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Fields drop in order: renderer, then context, then the lock.
+    struct Gl {
+        r: Renderer,
+        _ctx: crate::headless_egl::HeadlessContext,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    fn gl() -> Gl {
+        let lock = GL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (gl, ctx) = crate::headless_egl::init().expect("headless EGL context");
+        let r = Renderer::new(gl).expect("Renderer::new");
+        Gl {
+            r,
+            _ctx: ctx,
+            _lock: lock,
+        }
+    }
+
+    /// Red channel of an RGBA8 framebuffer.
+    fn read_red(gl: &glow::Context, fbo: glow::Framebuffer, w: u32, h: u32) -> Vec<u8> {
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.read_pixels(
+                0,
+                0,
+                w as i32,
+                h as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(&mut px),
+            );
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+        px.chunks(4).map(|p| p[0]).collect()
+    }
+
+    /// One Life step on a torus, matching the fixture's `(p + sz) % sz`.
+    fn life_step(cells: &[bool], n: usize) -> Vec<bool> {
+        (0..n * n)
+            .map(|i| {
+                let (x, y) = ((i % n) as isize, (i / n) as isize);
+                let mut count = 0;
+                for dy in -1..=1isize {
+                    for dx in -1..=1isize {
+                        if dx != 0 || dy != 0 {
+                            let nx = (x + dx).rem_euclid(n as isize) as usize;
+                            let ny = (y + dy).rem_euclid(n as isize) as usize;
+                            count += usize::from(cells[ny * n + nx]);
+                        }
+                    }
+                }
+                count == 3 || (cells[i] && count == 2)
+            })
+            .collect()
+    }
+
+    fn cells(state: &[f32]) -> Vec<bool> {
+        state.chunks(4).map(|t| t[0] > 0.5).collect()
+    }
+
+    #[test]
+    #[ignore = "needs EGL (run with --ignored)"]
+    fn life_state_pass_matches_cpu() {
+        let mut g = gl();
+        g.r.load_shader(&prepare_shader(LIFE), 1234)
+            .expect("life fixture loads");
+        let out = OffscreenTarget::new(g.r.gl(), 128, 128);
+        let dt = Some(1.0 / 30.0);
+
+        g.r.render_offscreen(out.fbo, [128, 128], 0.0, 0, dt);
+        let mut prev = cells(&g.r.sim.as_ref().unwrap().read_front(g.r.gl()));
+        let alive = prev.iter().filter(|c| **c).count();
+        assert!((800..2000).contains(&alive), "seed: {alive} of 4096 alive");
+
+        for k in 1..6u64 {
+            g.r.render_offscreen(out.fbo, [128, 128], k as f32 / 30.0, k, dt);
+            let sim = g.r.sim.as_ref().unwrap();
+            assert_eq!(sim.clock.step, k as u32 + 1);
+            let next = cells(&sim.read_front(g.r.gl()));
+            assert!(
+                next == life_step(&prev, 64),
+                "step {k} differs from CPU Life"
+            );
+
+            // Image pass: output pixel (2x, 2y) shows cell (x, y).
+            let red = read_red(g.r.gl(), out.fbo, 128, 128);
+            for (i, alive) in next.iter().enumerate() {
+                let (x, y) = (i % 64, i / 64);
+                let px = red[(2 * y) * 128 + 2 * x];
+                assert_eq!(px > 127, *alive, "image pass at cell ({x}, {y})");
+            }
+            prev = next;
+        }
+        out.destroy(g.r.gl());
+    }
+
+    #[test]
+    #[ignore = "needs EGL (run with --ignored)"]
+    fn life_seed_follows_u_seed() {
+        let mut g = gl();
+        let src = prepare_shader(LIFE);
+        let out = OffscreenTarget::new(g.r.gl(), 64, 64);
+        let mut seeded = Vec::new();
+        for seed in [1, 1, 2] {
+            g.r.load_shader(&src, seed).unwrap();
+            g.r.render_offscreen(out.fbo, [64, 64], 0.0, 0, None);
+            seeded.push(cells(&g.r.sim.as_ref().unwrap().read_front(g.r.gl())));
+        }
+        assert_eq!(seeded[0], seeded[1]);
+        assert_ne!(seeded[0], seeded[2]);
+        out.destroy(g.r.gl());
+    }
+
+    #[test]
+    #[ignore = "needs EGL (run with --ignored)"]
+    fn prev_frame_with_state_rejected_after_linking() {
+        let mut g = gl();
+        let sampled = "void mainState(out vec4 o, in vec2 fc) { o = texture(u_prev_frame, vec2(0.5)); }\n\
+                       void mainImage(out vec4 o, in vec2 fc) { o = texelFetch(u_state, ivec2(0), 0); }";
+        let err = g.r.load_shader(&prepare_shader(sampled), 0).unwrap_err();
+        assert!(format!("{err:#}").contains("u_prev_frame"), "{err:#}");
+        assert!(
+            g.r.program.is_none(),
+            "a rejected load leaves nothing installed"
+        );
+
+        let mentioned = "// unlike u_prev_frame, state lives in u_state\n\
+                         void mainState(out vec4 o, in vec2 fc) { o = vec4(1.0); }\n\
+                         void mainImage(out vec4 o, in vec2 fc) { o = texelFetch(u_state, ivec2(0), 0); }";
+        g.r.load_shader(&prepare_shader(mentioned), 0)
+            .expect("a comment mentioning u_prev_frame is fine");
+    }
+
+    /// State: (u_seed, u_step, tag). Image: the tag in red.
+    fn tagged(tag: f32) -> String {
+        prepare_shader(&format!(
+            "// @state size=4x4 hz=frame format=rgba32f\n\
+             void mainState(out vec4 o, in vec2 fc) {{ o = vec4(float(u_seed), float(u_step), {tag:.2}, 1.0); }}\n\
+             void mainImage(out vec4 o, in vec2 fc) {{ o = vec4(texelFetch(u_state, ivec2(0), 0).b, 0.0, 0.0, 1.0); }}"
+        ))
+    }
+
+    #[test]
+    #[ignore = "needs EGL (run with --ignored)"]
+    fn crossfade_keeps_outgoing_state_and_seed() {
+        let mut g = gl();
+        g.r.load_shader(&tagged(0.25), 7).unwrap();
+        g.r.render([64.0, 64.0]);
+        g.r.render([64.0, 64.0]);
+        g.r.start_shader_transition(&tagged(0.75), Some(60.0), 9)
+            .unwrap();
+
+        let texel = |sim: &Option<StateSim>, gl: &glow::Context| -> [f32; 4] {
+            let px = sim.as_ref().expect("sim").read_front(gl);
+            [px[0], px[1], px[2], px[3]]
+        };
+        g.r.render([64.0, 64.0]);
+        let out1 = texel(&g.r.outgoing_sim, g.r.gl());
+        g.r.render([64.0, 64.0]);
+        let out2 = texel(&g.r.outgoing_sim, g.r.gl());
+        let inc = texel(&g.r.sim, g.r.gl());
+
+        assert_eq!(out1[0], 7.0, "outgoing keeps its u_seed");
+        assert_eq!(out1[2], 0.25);
+        assert!(out2[1] > out1[1], "outgoing sim keeps stepping");
+        assert_eq!(
+            (inc[0], inc[2]),
+            (9.0, 0.75),
+            "incoming has its own seed and state"
+        );
+
+        // Each side's image pass drew from its own state.
+        let t = g.r.transition.as_ref().unwrap();
+        let a = read_red(g.r.gl(), t.fbo_a.fbo, 64, 64)[0];
+        let b = read_red(g.r.gl(), t.fbo_b.fbo, 64, 64)[0];
+        assert!((60..=70).contains(&a), "outgoing image pass: {a}");
+        assert!((185..=196).contains(&b), "incoming image pass: {b}");
+    }
+
+    #[test]
+    #[ignore = "needs EGL (run with --ignored)"]
+    fn state_thumbnail_is_not_black() {
+        let mut g = gl();
+        let px =
+            g.r.render_thumbnail(&prepare_shader(LIFE), 2.0)
+                .expect("thumbnail renders");
+        let lit = px.chunks(4).filter(|p| p[0] > 127).count();
+        assert!(lit > 64 * 64 / 10, "only {lit} lit pixels");
+    }
+
+    #[test]
+    #[ignore = "needs EGL (run with --ignored)"]
+    fn offscreen_state_pass_sees_explicit_time() {
+        let mut g = gl();
+        // A load well after Renderer::new: shader_start_elapsed is not 0.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        g.r.load_shader(
+            &prepare_shader(
+                "// @state size=4x4 hz=frame format=rgba32f\n\
+                 void mainState(out vec4 o, in vec2 fc) { o = vec4(iTime, iResolution.xy, 1.0); }\n\
+                 void mainImage(out vec4 o, in vec2 fc) { o = vec4(0.0); }",
+            ),
+            0,
+        )
+        .unwrap();
+        let out = OffscreenTarget::new(g.r.gl(), 32, 16);
+        g.r.render_offscreen(out.fbo, [32, 16], 12.5, 0, None);
+        let px = g.r.sim.as_ref().unwrap().read_front(g.r.gl());
+        assert_eq!(px[..3], [12.5, 32.0, 16.0], "state pass iTime, iResolution");
+        out.destroy(g.r.gl());
     }
 }

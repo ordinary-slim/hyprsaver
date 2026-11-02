@@ -892,7 +892,7 @@ pub fn with_state_pass_define(src: &str) -> String {
 ///    `void main()` wrapper. With `void mainState` (a stateful shader), also
 ///    inject the state uniforms; the wrapper then calls `mainState` when
 ///    compiled with [`STATE_PASS_DEFINE`] and `mainImage` otherwise.
-fn prepare_shader(raw: &str) -> String {
+pub(crate) fn prepare_shader(raw: &str) -> String {
     let source = raw.strip_prefix('\u{FEFF}').unwrap_or(raw);
 
     let is_shadertoy = source.contains("void mainImage");

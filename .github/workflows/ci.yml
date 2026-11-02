@@ -58,11 +58,20 @@ jobs:
             libegl1-mesa-dev \
             libgl1-mesa-dev \
             libxkbcommon-dev \
-            pkg-config
+            pkg-config \
+            libegl-mesa0 \
+            libgl1-mesa-dri \
+            libgbm1
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: test
       - run: cargo test --all-targets
+      - name: GL-backed tests (llvmpipe)
+        env:
+          # Mesa software rasteriser; no GPU is available on the runner.
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          EGL_PLATFORM: surfaceless
+        run: cargo test --all-targets -- --ignored
 
   audit:
     name: Security audit
