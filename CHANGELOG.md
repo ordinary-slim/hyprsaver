@@ -14,6 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same opening on every launch.
 - Preview panel "Lock seed" toggle that keeps `u_seed` across reloads, with the
   current value shown next to it.
+- Stateful shaders: a shader that defines `void mainState` gets a persistent
+  float state texture (`// @state` directive: size or scale, rate, 16F/32F
+  format), stepped at a fixed rate before `mainImage` reads it.
+- `reaction` shader: Gray-Scott reaction–diffusion that drifts through spots,
+  coral and mazes; added to the `nature` example playlist.
+
+### Fixed
+- Injected integer uniforms (`u_frame`, `u_seed`, and the new state uniforms)
+  are declared `highp`, so they can't wrap at 32767 on drivers that run
+  `mediump int` in 16 bits.
 
 
 ## [0.4.8] - 2026-10-21

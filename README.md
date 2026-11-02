@@ -61,6 +61,7 @@ cargo install hyprsaver
 | **oscilloscope** | ![oscilloscope](https://maravexa.github.io/hyprsaver/gallery/oscilloscope.webp) |
 | **planet** | ![planet](https://maravexa.github.io/hyprsaver/gallery/planet.webp) |
 | **plasma** | ![plasma](https://maravexa.github.io/hyprsaver/gallery/plasma.webp) |
+| **reaction** | ![reaction](https://maravexa.github.io/hyprsaver/gallery/reaction.webp) |
 | **shipburn** | ![shipburn](https://maravexa.github.io/hyprsaver/gallery/shipburn.webp) |
 | **snowfall** | ![snowfall](https://maravexa.github.io/hyprsaver/gallery/snowfall.webp) |
 | **sonar** | ![sonar](https://maravexa.github.io/hyprsaver/gallery/sonar.webp) |
@@ -223,6 +224,7 @@ graph TD
   | `waterfall`     | Stylized 2D waterfall with retro quantize-and-dither post |
   | `fibonacci`     | Phyllotaxis sunflower — golden-angle seed spiral growing outward, Fibonacci parastichy arms, golden log-spiral overlay |
   | `hyperflower`   | Psychedelic kaleidoscopic flower with folded filigree and a fixed rainbow palette |
+  | `reaction`      | Gray-Scott reaction–diffusion drifting through spots, coral and mazes (a stateful shader) |
 - **Built-in palette collection**: rainbow, autumn, vaporwave, frost, ember, ocean, monochrome, sunset, aurora, midnight
 - Configurable FPS and dismiss triggers
 - Mouse cursor hidden over screensaver surfaces; windowed preview keeps its cursor
@@ -623,6 +625,61 @@ hyprsaver accepts shaders written in Shadertoy's convention. The following remap
 | `iSeed` (hyprsaver extension) | `u_seed` |
 
 If your shader contains `void mainImage(out vec4 fragColor, in vec2 fragCoord)`, a `void main()` wrapper is appended automatically. You can paste most Shadertoy shaders directly (note: `iChannel` texture uniforms are not yet supported -- v1.0.0).
+
+### Stateful Shaders
+
+A Shadertoy-style shader that also defines `void mainState` runs a simulation:
+it gets a float state texture that persists between frames, in the spirit of
+Shadertoy's "Buffer A + Image". `mainState` is called once per texel per step
+and writes the next state; `mainImage` reads the state and writes the colour.
+The built-in `reaction` (Gray-Scott reaction–diffusion) is an example.
+
+```glsl
+#version 320 es
+precision highp float;
+precision highp int;   // needed for integer hashing of u_seed / u_step
+// @state size=256x256 hz=30 format=rgba16f
+
+void mainState(out vec4 o, in vec2 fc) {          // fc is in state texels
+    if (u_step == 0) { o = vec4(0.0); return; }   // step 0 seeds the state
+    float prev = texelFetch(u_state, ivec2(fc), 0).r;
+    vec2 pos = u_state_resolution * 0.5 + 80.0 * vec2(cos(u_sim_time), sin(u_sim_time));
+    float pen = 1.0 - smoothstep(4.0, 6.0, distance(fc, pos));
+    o = vec4(max(prev * 0.98, pen), 0.0, 0.0, 1.0); // a dot leaving a fading trail
+}
+
+void mainImage(out vec4 o, in vec2 fc) {
+    vec2 uv = fc / iResolution.xy;
+    o = vec4(palette(texture(u_state, uv).r), 1.0);
+}
+```
+
+The `// @state` line goes right after `#version` / `precision`; every key is
+optional:
+
+| Key | Values | Default | Meaning |
+|-----|--------|---------|---------|
+| `size` | `WxH` | — | Fixed state size in texels; survives resizes |
+| `scale` | float | `0.5` | State size = output size × scale; reseeded on resize. Ignored with `size` |
+| `hz` | float (≤ 2000), or `frame` | `60` | Simulation steps per second, or one step per rendered frame |
+| `format` | `rgba16f`, `rgba32f` | `rgba16f` | 32F for small per-step changes, positions, counters; 32F is not filterable, so read it with `texelFetch` |
+
+Uniforms added for stateful shaders:
+
+```glsl
+uniform sampler2D u_state;            // previous state (mainState) / current state (mainImage)
+uniform vec2  u_state_resolution;     // state size in texels
+uniform float u_dt;                   // seconds per step
+uniform int   u_step;                 // steps since load; 0 = seed
+uniform float u_sim_time;             // simulated seconds since load; use it, not u_time, in mainState
+```
+
+Limits: the state is reseeded on every load (cycle, hot-reload, relaunch);
+each monitor runs its own simulation; a shader can't both use `mainState` and
+sample `u_prev_frame`; a pass can only *gather* (each texel computes its own
+next value), so particles that scatter into other texels aren't possible.
+When a frame is late (an output that stopped presenting), the simulation slows
+down instead of catching up.
 
 ### Preview Mode — Control Panel
 
