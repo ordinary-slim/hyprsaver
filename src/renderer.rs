@@ -70,17 +70,55 @@ impl UniformLocations {
 // OffscreenTarget — FBO + color texture for offscreen rendering
 // ---------------------------------------------------------------------------
 
+/// Colour format of an [`OffscreenTarget`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetFormat {
+    /// `RGBA8`, `LINEAR` filtering. Display and crossfade targets.
+    Rgba8,
+    /// `RGBA16F`, `LINEAR` filtering (filterable in GLES 3.2).
+    Rgba16f,
+    /// `RGBA32F`, `NEAREST` filtering (32F filtering is not guaranteed);
+    /// read it with `texelFetch`.
+    Rgba32f,
+}
+
+impl TargetFormat {
+    fn internal(self) -> u32 {
+        match self {
+            TargetFormat::Rgba8 => glow::RGBA8,
+            TargetFormat::Rgba16f => glow::RGBA16F,
+            TargetFormat::Rgba32f => glow::RGBA32F,
+        }
+    }
+
+    fn data_type(self) -> u32 {
+        match self {
+            TargetFormat::Rgba8 => glow::UNSIGNED_BYTE,
+            TargetFormat::Rgba16f => glow::HALF_FLOAT,
+            TargetFormat::Rgba32f => glow::FLOAT,
+        }
+    }
+
+    fn filter(self) -> u32 {
+        match self {
+            TargetFormat::Rgba8 | TargetFormat::Rgba16f => glow::LINEAR,
+            TargetFormat::Rgba32f => glow::NEAREST,
+        }
+    }
+}
+
 /// A framebuffer object with a color texture attachment, used for offscreen
 /// rendering passes (e.g. rendering two shaders to textures and crossfading
 /// between them on the default framebuffer).
 ///
-/// The texture is allocated as `GL_RGBA8` with `GL_LINEAR` filtering and
-/// `GL_CLAMP_TO_EDGE` wrapping. No depth/stencil attachment — these targets
-/// are for 2D fullscreen passes only.
+/// The texture uses the target's [`TargetFormat`] (`GL_RGBA8` with
+/// `GL_LINEAR` filtering for [`OffscreenTarget::new`]) and `GL_CLAMP_TO_EDGE`
+/// wrapping. No depth/stencil attachment — these targets are for 2D
+/// fullscreen passes only.
 ///
 /// # Lifecycle
-/// - `new()` allocates the FBO and color texture
-/// - `resize()` reallocates the texture if dimensions changed
+/// - `new()` / `try_new()` allocate the FBO and color texture
+/// - `resize()` / `try_resize()` reallocate the texture if dimensions changed
 /// - `bind()` / `unbind()` switch draw target and viewport
 /// - `destroy()` must be called before the GL context is torn down
 pub struct OffscreenTarget {
@@ -88,10 +126,11 @@ pub struct OffscreenTarget {
     pub texture: glow::Texture,
     pub width: u32,
     pub height: u32,
+    pub format: TargetFormat,
 }
 
 impl OffscreenTarget {
-    /// Create a new offscreen target at the given dimensions.
+    /// Create a new `RGBA8` offscreen target at the given dimensions.
     ///
     /// # Panics
     /// Panics if GL fails to create the framebuffer or texture, or if the
@@ -101,153 +140,132 @@ impl OffscreenTarget {
     /// The caller must ensure a current GL context is bound on the calling
     /// thread.
     pub fn new(gl: &glow::Context, width: u32, height: u32) -> Self {
+        Self::try_new(gl, width, height, TargetFormat::Rgba8)
+            .unwrap_or_else(|e| panic!("OffscreenTarget: {e:#}"))
+    }
+
+    /// Create an offscreen target in the given format. Returns `Err` instead
+    /// of panicking when GL cannot create or complete the framebuffer, so a
+    /// float format a driver rejects fails the shader load, not the process.
+    pub fn try_new(
+        gl: &glow::Context,
+        width: u32,
+        height: u32,
+        format: TargetFormat,
+    ) -> anyhow::Result<Self> {
         unsafe {
             let fbo = gl
                 .create_framebuffer()
-                .expect("OffscreenTarget: create_framebuffer failed");
-            let texture = gl
-                .create_texture()
-                .expect("OffscreenTarget: create_texture failed");
-
-            // Allocate color texture storage.
-            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-            gl.tex_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                glow::RGBA8 as i32,
-                width as i32,
-                height as i32,
-                0,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                None,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MIN_FILTER,
-                glow::LINEAR as i32,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MAG_FILTER,
-                glow::LINEAR as i32,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_WRAP_S,
-                glow::CLAMP_TO_EDGE as i32,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_WRAP_T,
-                glow::CLAMP_TO_EDGE as i32,
-            );
-            gl.bind_texture(glow::TEXTURE_2D, None);
-
-            // Attach the texture as COLOR_ATTACHMENT0 on the FBO.
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-            gl.framebuffer_texture_2d(
-                glow::FRAMEBUFFER,
-                glow::COLOR_ATTACHMENT0,
-                glow::TEXTURE_2D,
-                Some(texture),
-                0,
-            );
-
-            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
-            if status != glow::FRAMEBUFFER_COMPLETE {
-                panic!(
-                    "OffscreenTarget: framebuffer incomplete after attachment \
-                     (status = 0x{status:04X}, size = {width}x{height})"
-                );
-            }
-
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-
-            Self {
+                .map_err(|e| anyhow::anyhow!("create_framebuffer failed: {e}"))?;
+            let texture = match Self::attach_texture(gl, fbo, width, height, format) {
+                Ok(t) => t,
+                Err(e) => {
+                    gl.delete_framebuffer(fbo);
+                    return Err(e);
+                }
+            };
+            Ok(Self {
                 fbo,
                 texture,
                 width,
                 height,
-            }
+                format,
+            })
         }
+    }
+
+    /// Allocate a color texture and attach it as `COLOR_ATTACHMENT0` of
+    /// `fbo`. Leaves the default framebuffer bound. On an incomplete
+    /// framebuffer the texture is deleted and `Err` returned.
+    ///
+    /// # Safety
+    /// A current GL context must be bound on the calling thread.
+    unsafe fn attach_texture(
+        gl: &glow::Context,
+        fbo: glow::Framebuffer,
+        width: u32,
+        height: u32,
+        format: TargetFormat,
+    ) -> anyhow::Result<glow::Texture> {
+        let texture = gl
+            .create_texture()
+            .map_err(|e| anyhow::anyhow!("create_texture failed: {e}"))?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            format.internal() as i32,
+            width as i32,
+            height as i32,
+            0,
+            glow::RGBA,
+            format.data_type(),
+            None,
+        );
+        let filter = format.filter() as i32;
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter);
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_S,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_T,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        gl.bind_texture(glow::TEXTURE_2D, None);
+
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(texture),
+            0,
+        );
+        let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        if status != glow::FRAMEBUFFER_COMPLETE {
+            gl.delete_texture(texture);
+            anyhow::bail!(
+                "framebuffer incomplete (status = 0x{status:04X}, \
+                 size = {width}x{height}, format = {format:?})"
+            );
+        }
+        Ok(texture)
     }
 
     /// Resize the color texture. No-op if the dimensions are unchanged.
     ///
-    /// The FBO handle itself is reused; only the backing texture is
-    /// reallocated and re-attached.
+    /// # Panics
+    /// Panics if the reallocated framebuffer is incomplete; see
+    /// [`OffscreenTarget::try_resize`].
     pub fn resize(&mut self, gl: &glow::Context, width: u32, height: u32) {
+        self.try_resize(gl, width, height)
+            .unwrap_or_else(|e| panic!("OffscreenTarget::resize: {e:#}"));
+    }
+
+    /// Resize the color texture, keeping the format. No-op if the dimensions
+    /// are unchanged. The FBO handle itself is reused; only the backing
+    /// texture is reallocated and re-attached.
+    pub fn try_resize(
+        &mut self,
+        gl: &glow::Context,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<()> {
         if width == self.width && height == self.height {
-            return;
+            return Ok(());
         }
-
         unsafe {
-            // Drop the old texture.
             gl.delete_texture(self.texture);
-
-            // Create + configure a replacement at the new size.
-            let texture = gl
-                .create_texture()
-                .expect("OffscreenTarget::resize: create_texture failed");
-            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-            gl.tex_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                glow::RGBA8 as i32,
-                width as i32,
-                height as i32,
-                0,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                None,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MIN_FILTER,
-                glow::LINEAR as i32,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MAG_FILTER,
-                glow::LINEAR as i32,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_WRAP_S,
-                glow::CLAMP_TO_EDGE as i32,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_WRAP_T,
-                glow::CLAMP_TO_EDGE as i32,
-            );
-            gl.bind_texture(glow::TEXTURE_2D, None);
-
-            // Re-attach the new texture to the existing FBO.
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
-            gl.framebuffer_texture_2d(
-                glow::FRAMEBUFFER,
-                glow::COLOR_ATTACHMENT0,
-                glow::TEXTURE_2D,
-                Some(texture),
-                0,
-            );
-
-            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
-            if status != glow::FRAMEBUFFER_COMPLETE {
-                panic!(
-                    "OffscreenTarget::resize: framebuffer incomplete after reattach \
-                     (status = 0x{status:04X}, size = {width}x{height})"
-                );
-            }
-
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-
-            self.texture = texture;
-            self.width = width;
-            self.height = height;
+            self.texture = Self::attach_texture(gl, self.fbo, width, height, self.format)?;
         }
+        self.width = width;
+        self.height = height;
+        Ok(())
     }
 
     /// Bind this FBO as the current draw target and set the viewport to its
@@ -441,6 +459,30 @@ impl FeedbackBuffers {
         };
         fb.clear(gl);
         fb
+    }
+
+    /// Allocate a pair in the given format and clear both. Returns `Err` if
+    /// the driver cannot render to that format.
+    pub fn new_with(
+        gl: &glow::Context,
+        width: u32,
+        height: u32,
+        format: TargetFormat,
+    ) -> anyhow::Result<Self> {
+        let a = OffscreenTarget::try_new(gl, width, height, format)?;
+        let b = match OffscreenTarget::try_new(gl, width, height, format) {
+            Ok(b) => b,
+            Err(e) => {
+                a.destroy(gl);
+                return Err(e);
+            }
+        };
+        let fb = Self {
+            targets: [a, b],
+            front: 0,
+        };
+        fb.clear(gl);
+        Ok(fb)
     }
 
     /// Reallocate both buffers if the size changed (contents are cleared).
