@@ -936,12 +936,16 @@ fn prepare_shader(raw: &str) -> String {
     //     GLSL drops the sampler when unused, so the renderer only allocates the
     //     buffers for shaders that actually reference it.
     //     u_seed is a per-load random value (same on all monitors, 0 in
-    //     render-preview / bench).
+    //     render-preview / bench). Its needle is type + name ("uint u_seed;")
+    //     so a declaration with an explicit precision also counts.
+    // Integer uniforms are declared highp: fragment shaders default to
+    // mediump int, which some drivers lower to 16 bits (counters wrap at
+    // 32767, seeds lose their high bits).
     const INJECTED_DECLS: &[(&str, &str)] = &[
         ("u_time", "uniform float u_time;\n"),
         ("u_resolution", "uniform vec2 u_resolution;\n"),
         ("u_mouse", "uniform vec2 u_mouse;\n"),
-        ("u_frame", "uniform int u_frame;\n"),
+        ("u_frame", "uniform highp int u_frame;\n"),
         ("out vec4 fragColor;", "out vec4 fragColor;\n"),
         ("uniform float u_alpha", "uniform float u_alpha;\n"),
         (
@@ -956,7 +960,7 @@ fn prepare_shader(raw: &str) -> String {
             "uniform sampler2D u_prev_frame",
             "uniform sampler2D u_prev_frame;\n",
         ),
-        ("uniform uint u_seed", "uniform uint u_seed;\n"),
+        ("uint u_seed;", "uniform highp uint u_seed;\n"),
     ];
     for (needle, decl) in INJECTED_DECLS {
         if !source.contains(needle) {
@@ -965,7 +969,7 @@ fn prepare_shader(raw: &str) -> String {
     }
 
     // ---- stateful shaders: state texture + simulation uniforms ----
-    // Full-declaration needles, like u_alpha. u_state is the previous state in
+    // Declaration needles (type + name), like u_seed. u_state is the previous state in
     // the state pass and the current state in the image pass (texture unit 4).
     const STATE_DECLS: &[(&str, &str)] = &[
         ("uniform sampler2D u_state", "uniform sampler2D u_state;\n"),
@@ -974,8 +978,8 @@ fn prepare_shader(raw: &str) -> String {
             "uniform vec2 u_state_resolution;\n",
         ),
         ("uniform float u_dt", "uniform float u_dt;\n"),
-        ("uniform int u_step", "uniform int u_step;\n"),
-        ("uniform int u_pass", "uniform int u_pass;\n"),
+        ("int u_step;", "uniform highp int u_step;\n"),
+        ("int u_pass;", "uniform highp int u_pass;\n"),
         ("uniform float u_sim_time", "uniform float u_sim_time;\n"),
     ];
     if is_stateful {
@@ -1098,7 +1102,7 @@ mod tests {
             "uniform float u_time;",
             "uniform vec2 u_resolution;",
             "uniform vec2 u_mouse;",
-            "uniform int u_frame;",
+            "uniform highp int u_frame;",
             "out vec4 fragColor;",
             "uniform float u_alpha;",
             "uniform float u_speed_scale;",
@@ -1390,12 +1394,13 @@ mod tests {
         // Used (or mentioned in a comment) but not declared → still injected.
         let src = "// u_seed salts the hash\nvoid main() { fragColor = vec4(float(u_seed)); }";
         let out = prepare_shader(src);
-        assert_eq!(out.matches("uniform uint u_seed;").count(), 1);
+        assert_eq!(out.matches("uniform highp uint u_seed;").count(), 1);
 
-        // Declared by the shader → not injected again.
-        let src = "uniform uint u_seed;\nvoid main() { fragColor = vec4(0.0); }";
-        let out = prepare_shader(src);
-        assert_eq!(out.matches("uniform uint u_seed;").count(), 1);
+        // Declared by the shader, with or without a precision → not injected again.
+        for decl in ["uniform uint u_seed;", "uniform highp uint u_seed;"] {
+            let src = format!("{decl}\nvoid main() {{ fragColor = vec4(0.0); }}");
+            assert_eq!(prepare_shader(&src).matches("uint u_seed;").count(), 1);
+        }
     }
 
     const STATE_BODY: &str = "void mainState(out vec4 o, in vec2 fc) { o = vec4(0.0); }\n\
@@ -1474,8 +1479,8 @@ mod tests {
             "uniform sampler2D u_state;",
             "uniform vec2 u_state_resolution;",
             "uniform float u_dt;",
-            "uniform int u_step;",
-            "uniform int u_pass;",
+            "uniform highp int u_step;",
+            "uniform highp int u_pass;",
             "uniform float u_sim_time;",
         ] {
             assert_eq!(out.matches(decl).count(), 1, "{decl}");
