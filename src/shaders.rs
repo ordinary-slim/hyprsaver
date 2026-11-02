@@ -150,6 +150,7 @@ pub const BUILTIN_FIBONACCI: &str = include_str!("../shaders/fibonacci.frag");
 /// Psychedelic polar flower with kaleidoscopic petals, folded filigree, and a fixed
 /// cosine rainbow palette. Pure screen-space math with four bounded iterations.
 pub const BUILTIN_HYPERFLOWER: &str = include_str!("../shaders/hyperflower.frag");
+pub const BUILTIN_REACTION: &str = include_str!("../shaders/reaction.frag");
 
 // ---------------------------------------------------------------------------
 // Vertex shader for the fullscreen quad (triangle-strip, no VBO needed)
@@ -374,6 +375,7 @@ impl ShaderManager {
             ("fireflies", BUILTIN_FIREFLIES),
             ("fibonacci", BUILTIN_FIBONACCI),
             ("hyperflower", BUILTIN_HYPERFLOWER),
+            ("reaction", BUILTIN_REACTION),
         ];
         for (name, raw_const) in builtins {
             let raw = raw_const
@@ -1071,7 +1073,7 @@ mod tests {
 
     #[test]
     fn test_builtin_shader_count() {
-        assert_eq!(manager().list().len(), 37);
+        assert_eq!(manager().list().len(), 38);
     }
 
     #[test]
@@ -1154,7 +1156,7 @@ mod tests {
             stems, registered,
             "shaders/*.frag files and registered built-ins must match exactly"
         );
-        assert_eq!(stems.len(), 37);
+        assert_eq!(stems.len(), 38);
     }
 
     #[test]
@@ -1199,6 +1201,7 @@ mod tests {
             "fireflies",
             "fibonacci",
             "hyperflower",
+            "reaction",
         ] {
             assert!(
                 names.contains(expected),

@@ -16,7 +16,7 @@ No items are committed yet. Candidates from the completed v0.4.7 sprint are list
 
 ### Candidates
 
-- [ ] Reaction-diffusion shader on the new feedback buffers (was blocked on ping-pong FBO)
+- [x] Reaction-diffusion shader: `reaction` (Gray-Scott), on the `@state` state pass rather than `u_prev_frame`
 - [ ] Trails / smoke shader using `u_prev_frame`
 - [ ] Re-baseline `docs/BENCHMARK_*` tiers on `bench` numbers (the historical radeontop % are ~3–4× higher than render-throughput %)
 
@@ -27,7 +27,6 @@ No items are committed yet. Candidates from the completed v0.4.7 sprint are list
 - **Matrix & terminal small-display scaling** — both look great on full displays but don't scale well to small WebP preview thumbnails. Needs DPI-aware glyph sizing or a small-display fallback path.
 - **Stonks pattern variation** — current pattern is repetitive. Needs additional variation modes or organic noise overlay.
 - **Eye shader** — Sauron-style or cat-eye, looking-around motion. New shader idea.
-- **Reaction-diffusion shader** — Gray-Scott or similar. Unblocked in v0.4.7 by `u_prev_frame` feedback buffers.
 
 ## Deferred Infrastructure
 

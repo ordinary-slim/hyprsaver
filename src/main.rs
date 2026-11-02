@@ -624,6 +624,10 @@ fn shader_descriptions() -> std::collections::HashMap<&'static str, &'static str
             "hyperflower",
             "Psychedelic kaleidoscopic flower with folded filigree and a fixed rainbow palette",
         ),
+        (
+            "reaction",
+            "Gray-Scott reaction–diffusion drifting through spots, coral and mazes",
+        ),
     ]
     .into_iter()
     .collect()

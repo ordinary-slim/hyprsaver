@@ -204,6 +204,7 @@ shaders = [
     "aurora",
     "clouds",
     "planet",
+    "reaction",
     "snowfall",
     "starfield",
 ]
