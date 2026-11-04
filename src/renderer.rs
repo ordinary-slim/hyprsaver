@@ -1764,6 +1764,7 @@ impl Renderer {
         state: Option<StateBinding>,
     ) {
         unsafe {
+            self.gl.disable(glow::BLEND);
             self.gl.use_program(Some(program));
 
             // Time / resolution / frame / mouse
@@ -2898,6 +2899,7 @@ mod gl_tests {
     use std::sync::{Mutex, MutexGuard};
 
     const LIFE: &str = include_str!("../tests/shaders/life.frag");
+    const ALPHA0: &str = include_str!("../tests/shaders/alpha0.frag");
 
     /// `HeadlessContext` terminates the process-wide EGL display on drop, so
     /// GL tests run one at a time.
@@ -3114,5 +3116,56 @@ mod gl_tests {
         let px = g.r.sim.as_ref().unwrap().read_front(g.r.gl());
         assert_eq!(px[..3], [12.5, 32.0, 16.0], "state pass iTime, iResolution");
         out.destroy(g.r.gl());
+    }
+
+    /// The blend state egui_glow leaves enabled after painting the preview
+    /// overlay (painter.rs, `paint_and_update_textures`).
+    fn leak_egui_blend(gl: &glow::Context) {
+        unsafe {
+            gl.enable(glow::BLEND);
+            gl.blend_equation_separate(glow::FUNC_ADD, glow::FUNC_ADD);
+            gl.blend_func_separate(
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+                glow::ONE_MINUS_DST_ALPHA,
+                glow::ONE,
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs EGL (run with --ignored)"]
+    fn state_pass_ignores_leaked_blend() {
+        let mut g = gl();
+        g.r.load_shader(&prepare_shader(ALPHA0), 1)
+            .expect("alpha0 fixture loads");
+        let out = OffscreenTarget::new(g.r.gl(), 32, 32);
+        let dt = Some(1.0 / 30.0);
+        for k in 0..10u64 {
+            leak_egui_blend(g.r.gl());
+            g.r.render_offscreen(out.fbo, [32, 32], k as f32 / 30.0, k, dt);
+        }
+        let px = g.r.sim.as_ref().unwrap().read_front(g.r.gl());
+        for r in px.iter().step_by(4) {
+            assert!((r - 0.25).abs() < 1e-3, "state texel {r}, expected 0.25");
+        }
+        out.destroy(g.r.gl());
+    }
+
+    #[test]
+    #[ignore = "needs EGL (run with --ignored)"]
+    fn state_thumbnail_ignores_leaked_blend() {
+        let mut g = gl();
+        leak_egui_blend(g.r.gl());
+        let px =
+            g.r.render_thumbnail(&prepare_shader(ALPHA0), 2.0)
+                .expect("thumbnail renders");
+        for p in px.chunks(4) {
+            assert!(
+                p[0].abs_diff(64) <= 2,
+                "thumbnail red {}, expected 64",
+                p[0]
+            );
+        }
     }
 }
